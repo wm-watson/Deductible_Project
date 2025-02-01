@@ -3,11 +3,18 @@
 library(tidyverse)
 library(beepr)
 
-#Filepath
-filepath <- "/Users/williamwatson/Library/CloudStorage/OneDrive-UniversityofArkansasforMedicalSciences/Deductible_Project/Deductibles/"
+# Read and examine data
 
-# Read data by adding filename to filepath
-final <- read.csv(paste0(filepath, "final.csv"),
-                  header = TRUE)
+# Filepath
+filepath <- "C:/Users/1187507/OneDrive - University of Arkansas for Medical Sciences/Deductible_Project/Deductibles/Data/final.csv"
+
+# Read the header and the first 1 million lines (including the header)
+lines <- read_lines(filepath, n_max = 1e6 + 1)  # +1 to include the header
+
+# Write the selected lines to a new file
+write_lines(lines, "selected_first_1m_rows.csv")
+
+selected_data <- read_csv("selected_first_1m_rows.csv")
 beep(8)
-#Bring in df, unique_mem, and final
+
+#Unique_mem, df, final
