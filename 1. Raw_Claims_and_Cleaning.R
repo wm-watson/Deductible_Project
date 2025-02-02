@@ -128,6 +128,69 @@ end.time-start.time
 beep(8)
 
 write_csv(filtered_chunks, "C:/Users/1187507/OneDrive - University of Arkansas for Medical Sciences/Deductible_Project/Deductibles/Data/Dissert_data/embed_deduc.csv")
+beep(8)
+
+### Continuation----
+start.time <- Sys.time()
+
+# Initialize variables with previous counts
+chunk_counter <- 70  # Starting from chunk 70
+total_rows_processed <- 70000000  # 70 million rows processed
+embedded_count <- 62263916  # Previous embedded count
+aggregate_count <- 536842  # Previous aggregate count
+filtered_chunks <- NULL
+
+# Callback function to process chunks
+process_chunk <- function(x, pos) {
+  chunk_counter <<- chunk_counter + 1
+  total_rows_processed <<- total_rows_processed + nrow(x)
+  
+  # Filter the chunk
+  filtered_chunk <- x %>%
+    filter(deductible_types %in% c("Embedded Only", "Aggregate Only"))
+  
+  # Update counts
+  embedded_count <<- embedded_count + sum(filtered_chunk$deductible_types == "Embedded Only")
+  aggregate_count <<- aggregate_count + sum(filtered_chunk$deductible_types == "Aggregate Only")
+  
+  # Save filtered chunk to disk immediately to prevent memory issues
+  if(nrow(filtered_chunk) > 0) {
+    write_csv(filtered_chunk, 
+              "filtered_results_continuation.csv", 
+              append = TRUE)
+  }
+  
+  # Print progress
+  print(paste("Processed chunk", chunk_counter, 
+              "- Rows in chunk:", nrow(x),
+              "- Total rows processed:", total_rows_processed))
+  print(paste("Current counts - Embedded:", embedded_count, 
+              "Aggregate:", aggregate_count))
+  
+  TRUE
+}
+
+# Process the remaining rows
+read_csv_chunked(filepath,
+                 callback = process_chunk,
+                 chunk_size = 1e6,
+                 skip = total_rows_processed)  # Skip previously processed rows
+
+# Print final summary
+print("\nFinal counts:")
+print(paste("Total Embedded Only:", embedded_count))
+print(paste("Total Aggregate Only:", aggregate_count))
+
+end.time <- Sys.time()
+print(end.time - start.time)
+beep(8)
+
+#### Combine with previous results----
+
+previous_results <- read_csv("previous_filtered_results.csv")
+continuation_results <- read_csv("filtered_results_continuation.csv")
+final_results <- bind_rows(previous_results, continuation_results)
+write_csv(final_results, "complete_filtered_results.csv")
 
 # 2. Clean Data----
 filepath <- "C:/Users/1187507/OneDrive - University of Arkansas for Medical Sciences/Deductible_Project/Deductibles/Data/Dissert_data/"
