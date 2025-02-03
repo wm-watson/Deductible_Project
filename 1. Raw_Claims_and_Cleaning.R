@@ -138,25 +138,24 @@ chunk_counter <- 70  # Starting from chunk 70
 total_rows_processed <- 70000000  # 70 million rows processed
 embedded_count <- 62263916  # Previous embedded count
 aggregate_count <- 536842  # Previous aggregate count
-filtered_chunks <- NULL
 
 # Callback function to process chunks
 process_chunk <- function(x, pos) {
   chunk_counter <<- chunk_counter + 1
   total_rows_processed <<- total_rows_processed + nrow(x)
   
-  # Filter the chunk
+  # Filter the chunk with correct column name
   filtered_chunk <- x %>%
-    filter(deductible_types %in% c("Embedded Only", "Aggregate Only"))
+    filter(`deductible_types` %in% c("Embedded Only", "Aggregate Only"))
   
   # Update counts
   embedded_count <<- embedded_count + sum(filtered_chunk$deductible_types == "Embedded Only")
   aggregate_count <<- aggregate_count + sum(filtered_chunk$deductible_types == "Aggregate Only")
   
-  # Save filtered chunk to disk immediately to prevent memory issues
+  # Append filtered chunk directly to the existing embed_deduc file
   if(nrow(filtered_chunk) > 0) {
     write_csv(filtered_chunk, 
-              "filtered_results_continuation.csv", 
+              "embed_deduc.csv", 
               append = TRUE)
   }
   
@@ -170,11 +169,12 @@ process_chunk <- function(x, pos) {
   TRUE
 }
 
-# Process the remaining rows
+# Process the remaining rows with explicit column names
 read_csv_chunked(filepath,
                  callback = process_chunk,
                  chunk_size = 1e6,
-                 skip = total_rows_processed)  # Skip previously processed rows
+                 skip = total_rows_processed,  # Skip previously processed rows
+                 col_names = col_names)  # Use the exact column names from the file
 
 # Print final summary
 print("\nFinal counts:")
@@ -182,15 +182,9 @@ print(paste("Total Embedded Only:", embedded_count))
 print(paste("Total Aggregate Only:", aggregate_count))
 
 end.time <- Sys.time()
-print(end.time - start.time)
+end.time - start.time
 beep(8)
 
-#### Combine with previous results----
-
-previous_results <- read_csv("previous_filtered_results.csv")
-continuation_results <- read_csv("filtered_results_continuation.csv")
-final_results <- bind_rows(previous_results, continuation_results)
-write_csv(final_results, "complete_filtered_results.csv")
 
 # 2. Clean Data----
 filepath <- "C:/Users/1187507/OneDrive - University of Arkansas for Medical Sciences/Deductible_Project/Deductibles/Data/Dissert_data/"
@@ -198,32 +192,98 @@ filepath <- "C:/Users/1187507/OneDrive - University of Arkansas for Medical Scie
 #data
 embed_deduc_raw <- read_csv("embed_deduc.csv")
 
-## A. Charlson Comorbidities----
-library(comorbidity)
+## A. Identify Cohorts----
+### Individual----
+start.time <- Sys.time()
 
-# Calculate CCI scores
-# Group data by both MVDID and Plan_year
-cci_scores <- embed_deduc_raw %>%
-  group_by(MVDID, Plan_year) %>%
-  group_split() %>%
-  lapply(function(person_year) {
-    cci <- comorbidity(
-      x = person_year,
-      id = "MVDID",
-      code = "CODEVALUE",
-      map = "icd10_charlson",
-      assign0 = TRUE
-    ) %>%
-      mutate(Plan_year = unique(person_year$Plan_year))
-    return(cci)
-  }) %>%
-  bind_rows()
+# Define the correct column names
+col_names <- c("X1", "COMPANY_KEY", "SUBGROUPKEY", "MEMBERID", "MVDID", "SUBSCRIBERID", 
+               "ZIPCODE", "PARTYKEY", "PLACEOFSERVICE", "PROCEDURECODE", "MOD1", 
+               "SERVICEFROMDATE", "REVENUECODE", "BILLEDAMOUNT", "NONCOVEREDAMOUNT", 
+               "ALLOWEDAMOUNT", "PAIDAMOUNT", "COBAMOUNT", "COINSURANCEAMOUNT", 
+               "COPAYAMOUNT", "DEDUCTIBLEAMOUNT", "PARTYKEY.1", "MEMBERKEY", 
+               "PLANGROUP", "LOB", "CLAIMNUMBER", "CODEVALUE", "CODETYPE", 
+               "PATIENTDOB", "PATIENTGENDER", "NETWORKINDICATOR", "Plan_year", 
+               "plan_year_start", "age_at_plan_year_start", "family_size", 
+               "DEDUCTIBLE_CATEGORY", "unique_deductible_types", "deductible_types")
 
-# Join back to original data
-embed_deduc_cci <- embed_deduc_raw %>%
-  left_join(cci_scores, by = c("MVDID" = "id", "Plan_year"))
-rm(embed_deduc_raw)
-rm(cci_scores)
+# Create empty temporary file with headers
+write_csv(data.frame(MVDID = character(), Plan_year = numeric()), 
+          "temp_mvdid_years.csv")
+
+# Callback function to process chunks
+process_chunk <- function(x, pos) {
+  # Extract unique MVDID-year combinations
+  chunk_mvdid_years <- x %>%
+    select(MVDID, Plan_year) %>%
+    distinct()
+  
+  # Append to storage, without column names
+  write_csv(chunk_mvdid_years, 
+            "temp_mvdid_years.csv", 
+            append = TRUE)
+  
+  # Print progress
+  print(paste("Processed chunk at position:", pos,
+              "- Unique combinations in this chunk:", nrow(chunk_mvdid_years)))
+  
+  TRUE
+}
+
+# Process the file to get all MVDID-year combinations
+read_csv_chunked("embed_deduc.csv",
+                 callback = process_chunk,
+                 chunk_size = 1e6,
+                 col_names = col_names,
+                 skip = 1)
+
+# Process the temporary file to get MVDIDs present for 2+ years
+mvdid_counts <- read_csv("temp_mvdid_years.csv") %>%
+  filter(!is.na(MVDID)) %>%  # Remove any NA values
+  distinct() %>%  # Remove any duplicates
+  group_by(MVDID) %>%
+  summarise(year_count = n_distinct(Plan_year)) %>%
+  filter(year_count >= 2)
+
+# Save the list of qualifying MVDIDs
+write_csv(mvdid_counts, "mvdid_multiple_years.csv")
+
+# Now filter the original data for these MVDIDs
+process_qualified_chunk <- function(x, pos) {
+  filtered_chunk <- x %>%
+    inner_join(mvdid_counts, by = "MVDID")
+  
+  # Save filtered chunk
+  write_csv(filtered_chunk, 
+            "embed_deduc_multiple_years.csv", 
+            append = TRUE)
+  
+  # Print progress
+  print(paste("Processed qualified chunk at position:", pos,
+              "- Rows in filtered chunk:", nrow(filtered_chunk)))
+  
+  TRUE
+}
+
+# Process original file again to save only records for qualifying MVDIDs
+read_csv_chunked("embed_deduc.csv",
+                 callback = process_qualified_chunk,
+                 chunk_size = 1e6,
+                 col_names = col_names,
+                 skip = 1)
+
+# Clean up temporary file
+unlink("temp_mvdid_years.csv")
+
+end.time <- Sys.time()
+print(paste("Total processing time:", end.time - start.time))
+
+# Print summary
+qualified_mvids <- nrow(mvdid_counts)
+print(paste("Number of MVDIDs present in 2+ years:", qualified_mvids))
+beep(8)
+
+### Firm----
 
 ## B. Deductible Switches----
 ### Firm----
@@ -352,3 +412,32 @@ print(stayers_summary)
 
 print("\nSubscribers Who Switched:")
 print(switchers_summary)
+
+
+## C. Charlson Comorbidities----
+library(comorbidity)
+
+# Calculate CCI scores
+# Group data by both MVDID and Plan_year
+cci_scores <- embed_deduc_raw %>%
+  group_by(MVDID, Plan_year) %>%
+  group_split() %>%
+  lapply(function(person_year) {
+    cci <- comorbidity(
+      x = person_year,
+      id = "MVDID",
+      code = "CODEVALUE",
+      map = "icd10_charlson",
+      assign0 = TRUE
+    ) %>%
+      mutate(Plan_year = unique(person_year$Plan_year))
+    return(cci)
+  }) %>%
+  bind_rows()
+
+# Join back to original data
+embed_deduc_cci <- embed_deduc_raw %>%
+  left_join(cci_scores, by = c("MVDID" = "id", "Plan_year"))
+rm(embed_deduc_raw)
+rm(cci_scores)
+
