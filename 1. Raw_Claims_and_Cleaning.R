@@ -186,6 +186,7 @@ end.time - start.time
 beep(8)
 
 
+<<<<<<< HEAD
 ## 2. Identify Cohorts----
 ### A. Individual----
 #data
@@ -272,12 +273,103 @@ read_csv_chunked(paste0(filepath, "final.csv"),
 
 # Clean up temporary file
 unlink(paste0(filepath, "temp_mvdid_years.csv"))
+=======
+# 2. Clean Data----
+filepath <- "C:/Users/1187507/OneDrive - University of Arkansas for Medical Sciences/Deductible_Project/Deductibles/Data/Dissert_data/"
+
+#data
+embed_deduc_raw <- read_csv("embed_deduc.csv")
+
+## A. Identify Cohorts----
+### Individual----
+start.time <- Sys.time()
+
+# Define the correct column names
+col_names <- c("X1", "COMPANY_KEY", "SUBGROUPKEY", "MEMBERID", "MVDID", "SUBSCRIBERID", 
+               "ZIPCODE", "PARTYKEY", "PLACEOFSERVICE", "PROCEDURECODE", "MOD1", 
+               "SERVICEFROMDATE", "REVENUECODE", "BILLEDAMOUNT", "NONCOVEREDAMOUNT", 
+               "ALLOWEDAMOUNT", "PAIDAMOUNT", "COBAMOUNT", "COINSURANCEAMOUNT", 
+               "COPAYAMOUNT", "DEDUCTIBLEAMOUNT", "PARTYKEY.1", "MEMBERKEY", 
+               "PLANGROUP", "LOB", "CLAIMNUMBER", "CODEVALUE", "CODETYPE", 
+               "PATIENTDOB", "PATIENTGENDER", "NETWORKINDICATOR", "Plan_year", 
+               "plan_year_start", "age_at_plan_year_start", "family_size", 
+               "DEDUCTIBLE_CATEGORY", "unique_deductible_types", "deductible_types")
+
+# Create empty temporary file with headers
+write_csv(data.frame(MVDID = character(), Plan_year = numeric()), 
+          "temp_mvdid_years.csv")
+
+# Callback function to process chunks
+process_chunk <- function(x, pos) {
+  # Extract unique MVDID-year combinations
+  chunk_mvdid_years <- x %>%
+    select(MVDID, Plan_year) %>%
+    distinct()
+  
+  # Append to storage, without column names
+  write_csv(chunk_mvdid_years, 
+            "temp_mvdid_years.csv", 
+            append = TRUE)
+  
+  # Print progress
+  print(paste("Processed chunk at position:", pos,
+              "- Unique combinations in this chunk:", nrow(chunk_mvdid_years)))
+  
+  TRUE
+}
+
+# Process the file to get all MVDID-year combinations
+read_csv_chunked("embed_deduc.csv",
+                 callback = process_chunk,
+                 chunk_size = 1e6,
+                 col_names = col_names,
+                 skip = 1)
+
+# Process the temporary file to get MVDIDs present for 2+ years
+mvdid_counts <- read_csv("temp_mvdid_years.csv") %>%
+  filter(!is.na(MVDID)) %>%  # Remove any NA values
+  distinct() %>%  # Remove any duplicates
+  group_by(MVDID) %>%
+  summarise(year_count = n_distinct(Plan_year)) %>%
+  filter(year_count >= 2)
+
+# Save the list of qualifying MVDIDs
+write_csv(mvdid_counts, "mvdid_multiple_years.csv")
+
+# Now filter the original data for these MVDIDs
+process_qualified_chunk <- function(x, pos) {
+  filtered_chunk <- x %>%
+    inner_join(mvdid_counts, by = "MVDID")
+  
+  # Save filtered chunk
+  write_csv(filtered_chunk, 
+            "embed_deduc_multiple_years.csv", 
+            append = TRUE)
+  
+  # Print progress
+  print(paste("Processed qualified chunk at position:", pos,
+              "- Rows in filtered chunk:", nrow(filtered_chunk)))
+  
+  TRUE
+}
+
+# Process original file again to save only records for qualifying MVDIDs
+read_csv_chunked("embed_deduc.csv",
+                 callback = process_qualified_chunk,
+                 chunk_size = 1e6,
+                 col_names = col_names,
+                 skip = 1)
+
+# Clean up temporary file
+unlink("temp_mvdid_years.csv")
+>>>>>>> 6620ce7c6b9c9e04b47441b8b42e3c83b8c3ddec
 
 end.time <- Sys.time()
 print(paste("Total processing time:", end.time - start.time))
 
 # Print summary
 qualified_mvids <- nrow(mvdid_counts)
+<<<<<<< HEAD
 print(paste("Number of MVDIDs present in 2+ consecutive years:", qualified_mvids))
 beep(8)
 
@@ -614,6 +706,141 @@ load(paste0(filepath, "claims_elix_age_fam.RData"))
 
 
 ### Claims----
+=======
+print(paste("Number of MVDIDs present in 2+ years:", qualified_mvids))
+beep(8)
+
+### Firm----
+
+## B. Deductible Switches----
+### Firm----
+company_patterns <- filtered_data %>%
+  distinct(COMPANY_CD, Plan_year, deductible_types) %>%
+  group_by(COMPANY_CD) %>%
+  summarize(
+    years_present = n_distinct(Plan_year),
+    min_year = min(Plan_year),
+    max_year = max(Plan_year),
+    # Create pattern with years
+    deductible_history = paste(paste(Plan_year, deductible_types), collapse = " -> "),
+    # Identify if stayed same or switched
+    status = case_when(
+      years_present == 1 ~ "Single year only",
+      n_distinct(deductible_types) == 1 ~ paste("Stayed", first(deductible_types)),
+      TRUE ~ "Switched"
+    )
+  ) %>%
+  # For switchers, identify the specific transition
+  mutate(
+    switch_details = case_when(
+      status == "Switched" ~ {
+        types <- str_extract_all(deductible_history, "Aggregate Only|Embedded Only")[[1]]
+        years <- str_extract_all(deductible_history, "\\d{4}")[[1]]
+        paste("Switched from", types[1], "in", years[1],
+              "to", types[length(types)], "in", years[length(years)])
+      },
+      TRUE ~ status
+    )
+  )
+
+# Summary statistics
+summary_stats <- company_patterns %>%
+  group_by(status) %>%
+  summarize(
+    count = n(),
+    pct = round(100 * n() / nrow(company_patterns), 1)
+  )
+
+# Detailed switch patterns
+switch_patterns <- company_patterns %>%
+  filter(status == "Switched") %>%
+  group_by(switch_details) %>%
+  summarize(
+    count = n(),
+    pct = round(100 * n() / sum(status == "Switched"), 1)
+  )
+
+print("Overall Summary:")
+print(summary_stats)
+
+print("\nDetailed Switch Patterns:")
+print(switch_patterns)
+
+### Individual----
+subscriber_patterns <- filtered_data %>%
+  distinct(SUBSCRIBER_ID, Plan_year, deductible_types) %>%
+  group_by(SUBSCRIBER_ID) %>%
+  summarize(
+    years_present = n_distinct(Plan_year),
+    min_year = min(Plan_year),
+    max_year = max(Plan_year),
+    deductible_history = paste(paste(Plan_year, deductible_types), collapse = " -> "),
+    # Identify type for stayers
+    consistent_type = if(n_distinct(deductible_types) == 1) first(deductible_types) else NA,
+    status = case_when(
+      years_present == 1 ~ paste("Single year:", first(deductible_types)),
+      n_distinct(deductible_types) == 1 ~ paste("Stayed on", first(deductible_types), 
+                                                "for", years_present, "years", 
+                                                "(", min_year, "to", max_year, ")"),
+      TRUE ~ "Switched"
+    )
+  ) %>%
+  # For switchers, identify the specific transition
+  mutate(
+    switch_details = case_when(
+      status == "Switched" ~ {
+        types <- str_extract_all(deductible_history, "Aggregate Only|Embedded Only")[[1]]
+        years <- str_extract_all(deductible_history, "\\d{4}")[[1]]
+        paste("Switched from", types[1], "in", years[1],
+              "to", types[length(types)], "in", years[length(years)])
+      },
+      TRUE ~ status
+    )
+  )
+
+# Summary statistics with detailed stay patterns
+summary_stats_subscriber <- subscriber_patterns %>%
+  group_by(status) %>%
+  summarize(
+    count = n(),
+    pct = round(100 * n() / nrow(subscriber_patterns), 1)
+  )
+
+# Separate summaries for different categories
+single_year_summary <- subscriber_patterns %>%
+  filter(str_detect(status, "Single year")) %>%
+  group_by(status) %>%
+  summarize(
+    count = n(),
+    pct = round(100 * n() / nrow(subscriber_patterns), 1)
+  )
+
+stayers_summary <- subscriber_patterns %>%
+  filter(str_detect(status, "Stayed")) %>%
+  group_by(status) %>%
+  summarize(
+    count = n(),
+    pct = round(100 * n() / nrow(subscriber_patterns), 1)
+  )
+
+switchers_summary <- subscriber_patterns %>%
+  filter(str_detect(status, "Switched")) %>%
+  group_by(switch_details) %>%
+  summarize(
+    count = n(),
+    pct = round(100 * n() / nrow(subscriber_patterns), 1)
+  )
+
+print("Single Year Subscribers:")
+print(single_year_summary)
+
+print("\nSubscribers Who Stayed on Same Type:")
+print(stayers_summary)
+
+print("\nSubscribers Who Switched:")
+print(switchers_summary)
+
+>>>>>>> 6620ce7c6b9c9e04b47441b8b42e3c83b8c3ddec
 
 ## C. Charlson Comorbidities----
 library(comorbidity)
@@ -642,5 +869,8 @@ embed_deduc_cci <- embed_deduc_raw %>%
 rm(embed_deduc_raw)
 rm(cci_scores)
 
+<<<<<<< HEAD
 
 
+=======
+>>>>>>> 6620ce7c6b9c9e04b47441b8b42e3c83b8c3ddec
