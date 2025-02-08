@@ -604,11 +604,119 @@ save(claims_elix_age_fam, file = paste0(filepath, "claims_elix_age_fam.RData"))
 load(paste0(filepath, "claims_elix_age_fam.RData"))
 
 ### G. Benefit Information----
+amiba_ben <- read_csv(paste0(filepath, "amiba_ben.csv"))
+amiha_ben <- read_csv(paste0(filepath, "amiha_ben.csv"))
+
+ha_ba_ben <- rbind(amiha_ben,amiba_ben)
+
+
+#Remove Observations where there is overlap
+cleaned_ha_ba <- ha_ba_ben %>% 
+  group_by(MVDID, Year) %>% 
+  mutate(
+    prev_overlap = lag(Overlap, default = FALSE)) %>% 
+  filter(!(Overlap == TRUE | prev_overlap == TRUE)) %>% 
+  select(-prev_overlap)
+
+#Flag if benefits change if multiple non-overlapping coverages
+
+cleaned_ha_ba <- cleaned_ha_ba %>% 
+  arrange(MVDID, Year, EFF_DATE) %>% 
+  group_by(MVDID, Year) %>% 
+  mutate(
+    prev_benefit_package = lag(BENEFIT_PKG),
+    benefit_package_change = if_else(
+      BENEFIT_PKG != prev_benefit_package & !is.na(prev_benefit_package), 1, 0),
+    has_benefit_change = max(benefit_package_change, na.rm = TRUE)) %>% 
+  ungroup()
+
+#Remove Observations where there is benefit change by MVDID and Year
+cleaned_no_ben_delta <- cleaned_ha_ba %>% 
+  filter(!(multiple_non_overlap_flag == 1 & has_benefit_change == 1))
+
+##### G1. Classify Deductibles----
+#Classify deductibles into Zero, Low, Medium, High
+#Convert character to numerical
+columns_to_convert <- c("DEDUCTIBLE", "CP_AMT_T1", "CP_AMT_T2", "CP_AMT_T3")
+
+
+for (col in columns_to_convert) {
+  
+  cleaned_no_ben_delta[[col]] <- as.numeric(cleaned_no_ben_delta[[col]])
+}
+
+clean_ben <- cleaned_no_ben_delta
+
+#Function to categorize deductibles
+categorize_deductibles <- function(deductibles) {
+  
+  deductible_categories <- rep(NA, length(deductibles))
+  
+  deductible_categories[deductibles==0] <- "Zero"
+  
+  #Get non-zero deductibles
+  non_zero_indices <- which(deductibles > 0)
+  
+  #Calculate terciles
+  if(length(non_zero_indices) > 0) {
+    tercile_breaks <- quantile(deductibles[non_zero_indices], probs = c(1/3, 2/3), na.rm = TRUE)
+    
+    #Print tercile ranges
+    cat("Tercile ranges(breakpoints):\n")
+    print(tercile_breaks)
+    
+    for(i in non_zero_indices) {
+      if (deductibles[i] <= tercile_breaks[1]) {
+        deductible_categories[i] <- "Low"
+      } else if (deductibles[i] <= tercile_breaks[2]) {
+        deductible_categories[i] <- "Medium"
+      } else {
+        deductible_categories[i] <- "High"
+      }
+    }
+    
+    return(deductible_categories)
+  }
+}
+
+clean_ben$DEDUCTIBLE <- as.numeric(clean_ben$DEDUCTIBLE)
+
+#Apply function to deductibles column
+clean_ben$deductible_category <- categorize_deductibles(clean_ben$DEDUCTIBLE)
+
+### H. HSA Plans----
+ben_hdhp <- read_csv("ben_hdhp.csv")
+HSA_Network <- read_csv("HSA_Network.csv")
+
+clean_ben_hsa <- clean_ben %>%
+  left_join(
+    HSA_Network %>% 
+      select(MVDID, HIER_EFF_DT, HIER_TERM_DT, HSA_CD) %>%
+      arrange(MVDID, desc(HIER_EFF_DT)) %>%
+      group_by(MVDID) %>%
+      slice(1) %>%
+      ungroup(),
+    by = "MVDID"
+  ) %>%
+  mutate(
+    hsa_ind = case_when(
+      EFF_DATE <= HIER_TERM_DT & 
+        TERM_DATE >= HIER_EFF_DT & 
+        HSA_CD %in% c("HSA-NoRX", "HSA-01RX", "HSA-04RX") ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  select(-HIER_EFF_DT, -HIER_TERM_DT, -HSA_CD)
+
+write_csv(clean_ben_hsa, "clean_ben_hsa.csv")
+
+### I. Combine Benefits Info----
 
 
 ## B. Firm Cohort----
 ### Firms----
-
+print("Claims file columns:")
+colnames(read_csv(paste0(filepath, "final.csv"), n_max = 1))
 
 ### Deductible Switch----
 
