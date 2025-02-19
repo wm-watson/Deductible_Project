@@ -281,6 +281,10 @@ qualified_mvids <- nrow(mvdid_counts)
 print(paste("Number of MVDIDs present in 2+ consecutive years:", qualified_mvids))
 beep(8)
 
+#### A1. Aggregate Only People----
+
+final_one <- read_csv("final.csv", n_max = 50)
+individual_one <- read_csv("individual.csv", n_max = 50)
 
 ### B. Deductible Switches----
 filepath <- "R:/GraduateStudents/WatsonWilliamP/Deductible_Project/Deductible_Project/Data/"
@@ -299,6 +303,7 @@ initial_subs <- character(0)
 temp_patterns <- data.frame(
   MVDID = character(),
   SUBSCRIBERID = character(),
+  COMPANY_KEY = double(),
   Plan_year = numeric(),
   deductible_types = character(),
   claim_count = numeric()
@@ -309,6 +314,7 @@ write_csv(temp_patterns, paste0(filepath, "temp_patterns.csv"))
 col_types <- cols(
   MVDID = col_character(),
   SUBSCRIBERID = col_character(),
+  COMPANY_KEY = col_double(),
   Plan_year = col_double(),
   deductible_types = col_character(),
   PAIDAMOUNT = col_double(),
@@ -322,9 +328,12 @@ process_chunk <- function(x, pos) {
   initial_subs <<- union(initial_subs, unique(x$SUBSCRIBERID))
   
   chunk_patterns <- x %>%
-    mutate(Plan_year = as.numeric(Plan_year)) %>%
+    mutate(
+      Plan_year = as.numeric(Plan_year),
+      COMPANY_KEY = as.numeric(COMPANY_KEY)
+    ) %>%
     filter(deductible_types %in% c("Aggregate Only", "Embedded Only")) %>%
-    group_by(MVDID, SUBSCRIBERID, Plan_year, deductible_types) %>%
+    group_by(MVDID, SUBSCRIBERID, COMPANY_KEY, Plan_year, deductible_types) %>%
     summarize(
       claim_count = n(),
       .groups = 'drop'
@@ -341,8 +350,41 @@ read_csv_chunked(paste0(filepath, "individual.csv"),
                  chunk_size = 1e6,
                  col_types = col_types)
 
-# Process patterns
-subscriber_patterns <- read_csv(paste0(filepath, "temp_patterns.csv")) %>%
+# Identify Aggregate-only MVDIDs/Companies that never switch
+aggregate_only_control <- read_csv(paste0(filepath, "temp_patterns.csv"), 
+                                   col_types = cols(
+                                     MVDID = col_character(),
+                                     SUBSCRIBERID = col_character(),
+                                     COMPANY_KEY = col_double(),
+                                     Plan_year = col_double(),
+                                     deductible_types = col_character(),
+                                     claim_count = col_double()
+                                   )) %>%
+  mutate(Plan_year = as.numeric(Plan_year)) %>%
+  group_by(MVDID, SUBSCRIBERID, COMPANY_KEY) %>%
+  summarize(
+    n_years = n_distinct(Plan_year),
+    all_types = list(unique(deductible_types)),
+    .groups = 'drop'
+  ) %>%
+  filter(
+    n_years >= 2,  # Must have at least 2 years of data
+    map_lgl(all_types, function(x) length(x) == 1 && x == "Aggregate Only")  # Only ever Aggregate
+  )
+
+# Save the control group MVDIDs
+write_csv(aggregate_only_control, paste0(filepath, "aggregate_only_control.csv"))
+
+# Process patterns for switchers
+subscriber_patterns <- read_csv(paste0(filepath, "temp_patterns.csv"),
+                                col_types = cols(
+                                  MVDID = col_character(),
+                                  SUBSCRIBERID = col_character(),
+                                  COMPANY_KEY = col_double(),
+                                  Plan_year = col_double(),
+                                  deductible_types = col_character(),
+                                  claim_count = col_double()
+                                )) %>%
   mutate(Plan_year = as.numeric(Plan_year)) %>%
   group_by(MVDID, SUBSCRIBERID, Plan_year) %>%
   summarize(
@@ -392,6 +434,53 @@ subscriber_patterns <- read_csv(paste0(filepath, "temp_patterns.csv")) %>%
                            "to", switch_to, "in", switch_year)
   )
 
+# Process claims for control group
+process_control_chunk <- function(chunk, control_info) {
+  processed <- chunk %>%
+    mutate(COMPANY_KEY = as.numeric(COMPANY_KEY)) %>%
+    inner_join(control_info, by = c("MVDID", "SUBSCRIBERID", "COMPANY_KEY")) %>%
+    mutate(
+      control_group = TRUE,
+      period = "Control",
+      period_type = "control"
+    )
+  
+  return(processed)
+}
+
+# Get and save control group claims
+get_control_claims_chunked <- function(filepath, control_info, chunk_size = 1e6) {
+  claims_analyzed <- tibble()
+  
+  callback <- function(chunk, pos) {
+    processed_chunk <- process_control_chunk(chunk, control_info)
+    
+    if(nrow(processed_chunk) > 0) {
+      claims_analyzed <<- bind_rows(claims_analyzed, processed_chunk)
+    }
+    print(paste("Processed chunk", pos))
+    TRUE
+  }
+  
+  read_csv_chunked(
+    file = paste0(filepath, "individual.csv"),
+    callback = callback,
+    chunk_size = chunk_size,
+    col_types = col_types
+  )
+  
+  return(claims_analyzed)
+}
+
+# Get and save control group claims
+control_claims <- get_control_claims_chunked(
+  filepath, 
+  aggregate_only_control, 
+  chunk_size = 1e6
+)
+
+write_csv(control_claims, paste0(filepath, "control_claims.csv"))
+
 # Generate summary statistics
 print("\nSwitch Direction Summary:")
 switch_summary <- subscriber_patterns %>%
@@ -403,11 +492,26 @@ switch_summary <- subscriber_patterns %>%
     .groups = 'drop'
   )
 print(switch_summary)
+
+# Print control group summary
+print("\nControl Group Summary:")
+control_summary <- aggregate_only_control %>%
+  summarise(
+    n_subscribers = n_distinct(SUBSCRIBERID),
+    n_mvids = n_distinct(MVDID),
+    avg_mvids_per_subscriber = n_distinct(MVDID) / n_distinct(SUBSCRIBERID),
+    avg_years = mean(n_years),
+    min_years = min(n_years),
+    max_years = max(n_years)
+  )
+print(control_summary)
+
 end.time <- Sys.time()
-end.time-start.time
+print(paste("Total processing time:", end.time - start.time))
 beep(8)
 
-### C. Claims----
+
+### C. Treatment/Claims----
 library(lubridate)
 library(tidyverse)
 library(beepr)
@@ -496,9 +600,7 @@ claims_data <- get_switcher_claims_chunked(filepath, switcher_mvids, subscriber_
 print(paste("Execution time:", Sys.time() - start.time))
 beep(8)
 
-### D. Elixhauser Comorbidities----
-library(comorbidity)
-
+#### 1. Elixhauser Comorbidities----
 library(comorbidity)
 
 # 1. Calculate Elixhauser scores by MVDID and Plan_year
@@ -576,7 +678,7 @@ print(bin_summary)
 print("\nPeriod Summary:")
 print(period_summary)
 
-### E. Age Bins----
+#### 2. Age Bins----
 breaks <- c(0, 4, 12, 17, 34, 49, 64)
 labels <- c("0-4", "5-12", "13-17", "18-34", "35-49", "50-64")
 
@@ -587,7 +689,7 @@ claims_with_elix_age <- claims_with_elix %>%
                          include.lowest = TRUE, 
                          right = FALSE))
 
-### F. Family Size----
+#### 3. Family Size----
 #Calculate family size and create bins
 claims_elix_age_fam <- claims_with_elix_age %>%
   group_by(SUBSCRIBERID, Plan_year) %>%
@@ -603,7 +705,7 @@ claims_elix_age_fam <- claims_with_elix_age %>%
 save(claims_elix_age_fam, file = paste0(filepath, "claims_elix_age_fam.RData"))
 load(paste0(filepath, "claims_elix_age_fam.RData"))
 
-### G. Benefit Information----
+#### 4. Benefit Information----
 amiba_ben <- read_csv(paste0(filepath, "amiba_ben.csv"))
 amiha_ben <- read_csv(paste0(filepath, "amiha_ben.csv"))
 
@@ -634,7 +736,7 @@ cleaned_ha_ba <- cleaned_ha_ba %>%
 cleaned_no_ben_delta <- cleaned_ha_ba %>% 
   filter(!(multiple_non_overlap_flag == 1 & has_benefit_change == 1))
 
-##### G1. Classify Deductibles----
+##### 4a. Classify Deductibles----
 #Classify deductibles into Zero, Low, Medium, High
 #Convert character to numerical
 columns_to_convert <- c("DEDUCTIBLE", "CP_AMT_T1", "CP_AMT_T2", "CP_AMT_T3")
@@ -684,7 +786,7 @@ clean_ben$DEDUCTIBLE <- as.numeric(clean_ben$DEDUCTIBLE)
 #Apply function to deductibles column
 clean_ben$deductible_category <- categorize_deductibles(clean_ben$DEDUCTIBLE)
 
-### H. HSA Plans----
+#### 5. HSA Plans----
 ben_hdhp <- read_csv("ben_hdhp.csv")
 HSA_Network <- read_csv("HSA_Network.csv")
 
@@ -710,45 +812,499 @@ clean_ben_hsa <- clean_ben %>%
 
 write_csv(clean_ben_hsa, "clean_ben_hsa.csv")
 
-### I. Combine Benefits Info----
+#### 6. Combine Benefits Info----
 
+# Rename Year
+clean_ben_hsa_mod <- clean_ben_hsa %>%
+  rename(Plan_year = Year) %>%
+  select(-MEMBERID) # Remove duplicate column
 
-## B. Firm Cohort----
-### Firms----
-print("Claims file columns:")
-colnames(read_csv(paste0(filepath, "final.csv"), n_max = 1))
+# Join on both MVDID and Plan_year
+treatment_claims_final <- claims_elix_age_fam %>%
+  left_join(clean_ben_hsa_mod,
+            by = c("MVDID", "Plan_year"),
+            suffix = c("", "_ben"))
 
-### Deductible Switch----
-
-
-### Claims----
-
-## C. Charlson Comorbidities----
+### D. Control/Claims----
+#### 1. Elixhauser Comorbidities ----
 library(comorbidity)
 
-# Calculate CCI scores
-# Group data by both MVDID and Plan_year
-cci_scores <- embed_deduc_raw %>%
-  group_by(MVDID, Plan_year) %>%
-  group_split() %>%
-  lapply(function(person_year) {
-    cci <- comorbidity(
-      x = person_year,
+# 1. Calculate Elixhauser scores by MVDID and Plan_year
+elix <- control_claims %>% 
+  filter(!is.na(CODEVALUE)) %>%
+  select(MVDID, CODEVALUE, Plan_year) %>%
+  distinct() %>%
+  split(.$Plan_year) %>%
+  lapply(function(year_data) {
+    comorbidity(
+      x = year_data %>% select(MVDID, CODEVALUE),
       id = "MVDID",
       code = "CODEVALUE",
-      map = "icd10_charlson",
-      assign0 = TRUE
+      map = "elixhauser_icd10_quan",
+      assign0 = FALSE
     ) %>%
-      mutate(Plan_year = unique(person_year$Plan_year))
-    return(cci)
+      mutate(Plan_year = unique(year_data$Plan_year))
   }) %>%
   bind_rows()
 
-# Join back to original data
-embed_deduc_cci <- embed_deduc_raw %>%
-  left_join(cci_scores, by = c("MVDID" = "id", "Plan_year"))
-rm(embed_deduc_raw)
-rm(cci_scores)
+# 2. Calculate total comorbidities by year
+elix_scores <- elix %>%
+  mutate(
+    tot_comorbidities = rowSums(select(., -MVDID, -Plan_year))
+  ) %>%
+  select(MVDID, Plan_year, tot_comorbidities)
 
+# 3. Add scores to control claims and create bins
+breaks <- c(0, 1, 2, 3, Inf)
+labels <- c("0", "1", "2", "3+")
 
+control_claims_with_elix <- control_claims %>%
+  left_join(elix_scores, by = c("MVDID", "Plan_year")) %>%
+  mutate(
+    tot_comorbidities = coalesce(tot_comorbidities, 0),
+    comorbid_bins = cut(tot_comorbidities, 
+                        breaks = breaks, 
+                        labels = labels, 
+                        include.lowest = TRUE,
+                        right = FALSE)
+  )
 
+#### 2. Age Bins----
+breaks <- c(0, 4, 12, 17, 34, 49, 64)
+labels <- c("0-4", "5-12", "13-17", "18-34", "35-49", "50-64")
+
+control_claims_with_elix_age <- control_claims_with_elix %>%
+  mutate(age_group = cut(age_at_plan_year_start, 
+                         breaks = breaks, 
+                         labels = labels, 
+                         include.lowest = TRUE, 
+                         right = FALSE))
+
+#### 3. Family Size----
+control_claims_elix_age_fam <- control_claims_with_elix_age %>%
+  group_by(SUBSCRIBERID, Plan_year) %>%
+  mutate(new_fam_size = n_distinct(MVDID)) %>%
+  ungroup() %>%
+  mutate(family_size_bins = cut(new_fam_size,
+                                breaks = c(0, 2, 3, 4, 5, Inf),
+                                labels = c("2", "3", "4", "5", "6+"),
+                                include.lowest = TRUE,
+                                right = FALSE))
+
+#### 4. Combine Claims and Benefits----
+clean_ben_hsa <- read_csv(paste0(filepath, "clean_ben_hsa.csv")) %>%
+  rename(Plan_year = Year)  # Rename Year to Plan_year for joining
+
+# Final Join
+control_claims_final <- control_claims_elix_age_fam %>%
+  left_join(clean_ben_hsa,
+            by = c("MVDID", "Plan_year"),
+            suffix = c("", "_ben"))
+
+# ##### Final Dataset----
+save(control_claims_final, file = paste0(filepath, "control_claims_final.RData"))
+
+# Generate summary statistics
+print("Control Group Summary Statistics:")
+summary_stats <- control_claims_final %>%
+  summarise(
+    n_subscribers = n_distinct(SUBSCRIBERID),
+    n_mvids = n_distinct(MVDID),
+    avg_comorbidities = mean(tot_comorbidities, na.rm = TRUE),
+    avg_family_size = mean(new_fam_size, na.rm = TRUE),
+    pct_hsa = mean(hsa_ind, na.rm = TRUE) * 100
+  )
+print(summary_stats)
+
+# 3. Prepare for DiD----
+## A. Clean and standardize columns----
+
+# Clean control claims
+control_claims_clean <- control_claims_final %>%
+  select(-matches("^\\.\\.\\.[0-9]+$"), -matches("MEMBERID_ben")) %>%
+  # Keep all original columns for further variable construction
+  select(
+    everything(),
+    -any_of(c("switch_year", "pre_switch_year", "switch_from", "switch_to", 
+              "switch_type", "switch_details", "treatment", "period"))
+  )
+
+# Clean treatment claims
+treatment_claims_clean <- treatment_claims_final %>%
+  select(-matches("^\\.\\.\\.[0-9]+$"), -matches("MEMBERID_ben")) %>%
+  # Keep treatment-specific columns
+  select(everything())
+
+## B. Set up diff-in-diff structure ----
+# Create treatment indicators
+control_claims_did <- control_claims_clean %>%
+  group_by(MVDID) %>%
+  mutate(
+    switch_year = median(treatment_claims_clean$switch_year, na.rm = TRUE),
+    pre_switch_year = switch_year - 1,
+    period = case_when(
+      Plan_year < switch_year ~ "Pre",
+      Plan_year >= switch_year ~ "Post",
+      TRUE ~ NA_character_
+    ),
+    switch_from = "No Switch",
+    switch_to = "No Switch",
+    switch_type = "Control",
+    switch_details = "Control Group - No Switch",
+    treatment = 0
+  ) %>%
+  ungroup()
+
+treatment_claims_did <- treatment_claims_clean %>%
+  mutate(
+    period = case_when(
+      Plan_year < switch_year ~ "Pre",
+      Plan_year >= switch_year ~ "Post",
+      TRUE ~ NA_character_
+    ),
+    treatment = 1
+  )
+
+## C. Combine datasets and create balanced window ----
+diff_in_diff_data <- bind_rows(
+  control_claims_did,
+  treatment_claims_did
+) %>%
+  mutate(
+    post = ifelse(period == "Post", 1, 0),
+    treat_post = treatment * post,
+    time_to_switch = Plan_year - switch_year
+  ) %>%
+  # Add balanced window calculations
+  group_by(MVDID) %>%
+  mutate(
+    years_pre = sum(period == "Pre"),
+    years_post = sum(period == "Post"),
+    balanced_window = years_pre >= 1 & years_post >= 1  # At least 1 year pre and post
+  ) %>%
+  ungroup()
+
+## D. Generate summary statistics ----
+# Check balance before and after window restriction
+balance_comparison <- diff_in_diff_data %>%
+  group_by(treatment) %>%
+  summarise(
+    total_members = n_distinct(MVDID),
+    balanced_members = n_distinct(MVDID[balanced_window == TRUE]),
+    pct_balanced = balanced_members/total_members * 100,
+    .groups = 'drop'
+  )
+
+# Summary stats for balanced sample
+balanced_summary <- diff_in_diff_data %>%
+  filter(balanced_window == TRUE) %>%
+  group_by(treatment, period) %>%
+  summarise(
+    n_claims = n(),
+    n_members = n_distinct(MVDID),
+    avg_paid = mean(PAIDAMOUNT, na.rm = TRUE),
+    med_paid = median(PAIDAMOUNT, na.rm = TRUE),
+    avg_deductible = mean(DEDUCTIBLE, na.rm = TRUE),
+    avg_comorbidities = mean(tot_comorbidities, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Print results
+print("\nBalance Comparison Before/After Window Restriction:")
+print(balance_comparison)
+
+print("\nSummary Statistics for Balanced Sample:")
+print(balanced_summary)
+
+# Create final balanced dataset
+balanced_did_data <- diff_in_diff_data %>%
+  filter(balanced_window == TRUE)
+
+# Save the balanced dataset
+save(balanced_did_data, file = paste0(filepath, "balanced_did_data.RData"))
+
+## E. Utilization categories----
+# STEP 1: CREATE PROCEDURE CATEGORIES
+procedure_categories <- balanced_did_data %>%
+  mutate(
+    procedure_category = case_when(
+      # Anesthesia
+      PROCEDURECODE >= '00100' & PROCEDURECODE <= '01999' ~ 'Anesthesia',
+      
+      # Surgery by section
+      PROCEDURECODE >= '10021' & PROCEDURECODE <= '69990' ~ 'Surgery',
+      
+      # Radiology
+      PROCEDURECODE >= '70010' & PROCEDURECODE <= '79999' ~ 'Radiology',
+      
+      # Pathology/Laboratory
+      PROCEDURECODE >= '80047' & PROCEDURECODE <= '89398' ~ 'Laboratory/Pathology',
+      
+      # Medicine (excluding E&M)
+      PROCEDURECODE >= '90281' & PROCEDURECODE <= '98943' ~ 'Medicine',
+      
+      # E&M Services
+      PROCEDURECODE >= '99201' & PROCEDURECODE <= '99499' ~ 'E&M Services',
+      
+      # Category III codes
+      PROCEDURECODE >= '0001T' & PROCEDURECODE <= '9999T' ~ 'Category III/Temporary',
+      
+      # HCPCS Level II codes
+      substr(PROCEDURECODE, 1, 1) == 'A' ~ 'Medical Supplies/DME',
+      substr(PROCEDURECODE, 1, 1) == 'B' ~ 'Enteral/Parenteral Therapy',
+      substr(PROCEDURECODE, 1, 1) == 'C' ~ 'Temporary Hospital OP Services',
+      substr(PROCEDURECODE, 1, 1) == 'D' ~ 'Dental Procedures',
+      substr(PROCEDURECODE, 1, 1) == 'E' ~ 'Durable Medical Equipment',
+      substr(PROCEDURECODE, 1, 1) == 'G' ~ 'Temporary Procedures/Services',
+      substr(PROCEDURECODE, 1, 1) == 'H' ~ 'Rehabilitative Services',
+      substr(PROCEDURECODE, 1, 1) == 'J' ~ 'Drugs/Biologicals',
+      substr(PROCEDURECODE, 1, 1) == 'K' ~ 'Temporary Codes',
+      substr(PROCEDURECODE, 1, 1) == 'L' ~ 'Orthotic/Prosthetic',
+      substr(PROCEDURECODE, 1, 1) == 'M' ~ 'Medical Services',
+      substr(PROCEDURECODE, 1, 1) == 'P' ~ 'Pathology/Laboratory',
+      substr(PROCEDURECODE, 1, 1) == 'Q' ~ 'Temporary Codes',
+      substr(PROCEDURECODE, 1, 1) == 'R' ~ 'Diagnostic Radiology',
+      substr(PROCEDURECODE, 1, 1) == 'S' ~ 'Private Payer Codes',
+      substr(PROCEDURECODE, 1, 1) == 'T' ~ 'State Medicaid Codes',
+      substr(PROCEDURECODE, 1, 1) == 'V' ~ 'Vision/Hearing Services',
+      TRUE ~ 'Other'
+    )
+  )
+
+# STEP 2: ANALYZE FREQUENCIES BY GROUP AND PERIOD
+utilization_freq <- procedure_categories %>%
+  group_by(treatment, period, procedure_category) %>%
+  summarise(
+    n_claims = n(),
+    n_members = n_distinct(MVDID),
+    total_paid = sum(PAIDAMOUNT, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  group_by(treatment, period) %>%
+  mutate(
+    pct_of_total = n_claims / sum(n_claims) * 100,
+    claims_per_member = n_claims / n_members,
+    avg_paid = total_paid / n_claims
+  ) %>%
+  arrange(treatment, period, -n_claims)
+
+# STEP 3: CALCULATE CHANGES BETWEEN PERIODS
+utilization_changes <- utilization_freq %>%
+  select(treatment, period, procedure_category, n_claims, pct_of_total) %>%
+  pivot_wider(
+    names_from = period,
+    values_from = c(n_claims, pct_of_total)
+  ) %>%
+  mutate(
+    pct_change = ((n_claims_Post - n_claims_Pre) / n_claims_Pre) * 100,
+    share_change = pct_of_total_Post - pct_of_total_Pre
+  ) %>%
+  arrange(treatment, -pct_change)
+
+# STEP 4: PRINT RESULTS
+# Control Group - Pre
+print("\nControl Group - Pre Period:")
+print(utilization_freq %>% 
+        filter(treatment == 0, period == "Pre") %>%
+        select(procedure_category, n_claims, pct_of_total, claims_per_member, avg_paid) %>%
+        arrange(-n_claims))
+
+# Control Group - Post
+print("\nControl Group - Post Period:")
+print(utilization_freq %>% 
+        filter(treatment == 0, period == "Post") %>%
+        select(procedure_category, n_claims, pct_of_total, claims_per_member, avg_paid) %>%
+        arrange(-n_claims))
+
+# Treatment Group - Pre
+print("\nTreatment Group - Pre Period:")
+print(utilization_freq %>% 
+        filter(treatment == 1, period == "Pre") %>%
+        select(procedure_category, n_claims, pct_of_total, claims_per_member, avg_paid) %>%
+        arrange(-n_claims))
+
+# Treatment Group - Post
+print("\nTreatment Group - Post Period:")
+print(utilization_freq %>% 
+        filter(treatment == 1, period == "Post") %>%
+        select(procedure_category, n_claims, pct_of_total, claims_per_member, avg_paid) %>%
+        arrange(-n_claims))
+
+# Percentage Changes
+print("\nPercentage Changes by Group:")
+print(utilization_changes %>%
+        select(treatment, procedure_category, pct_change, share_change) %>%
+        arrange(treatment, -abs(pct_change)))
+
+### e1. Analytical Dataset----
+top_10_procedures <- procedure_categories %>%
+  group_by(PROCEDURECODE, procedure_category) %>%
+  summarise(
+    frequency = n(),
+    total_paid = sum(PAIDAMOUNT, na.rm = TRUE),
+    avg_paid = mean(PAIDAMOUNT, na.rm = TRUE),
+    n_members = n_distinct(MVDID),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(frequency)) %>%
+  head(25)
+
+print(top_10_procedures)
+
+# Distribution by treatment group and period
+top_10_by_treatment <- procedure_categories %>%
+  filter(PROCEDURECODE %in% top_10_procedures$PROCEDURECODE) %>%
+  group_by(PROCEDURECODE, procedure_category, treatment, period) %>%
+  summarise(
+    frequency = n(),
+    avg_paid = mean(PAIDAMOUNT, na.rm = TRUE),
+    n_members = n_distinct(MVDID),
+    .groups = 'drop'
+  ) %>%
+  arrange(PROCEDURECODE, treatment, period)
+
+print(top_10_by_treatment)
+
+# Average cost per member
+top_10_member_costs <- procedure_categories %>%
+  filter(PROCEDURECODE %in% top_10_procedures$PROCEDURECODE) %>%
+  group_by(PROCEDURECODE, MVDID) %>%
+  summarise(
+    visits_per_member = n(),
+    avg_paid_per_member = mean(PAIDAMOUNT, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  group_by(PROCEDURECODE) %>%
+  summarise(
+    avg_visits_per_member = mean(visits_per_member),
+    median_visits_per_member = median(visits_per_member),
+    avg_cost_per_member = mean(avg_paid_per_member, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+print(top_10_member_costs)
+
+## F. Analytical Dataset----
+final_analytical_dataset <- balanced_did_data %>%
+  mutate(
+    # Outcome Variables (Visit Types)
+    is_primary_care = case_when(
+      PROCEDURECODE %in% c('99214', '99213', '99203', '99204', '99396') ~ 1,
+      TRUE ~ 0
+    ),
+    is_physical_therapy = case_when(
+      PROCEDURECODE %in% c('97110', '97530', '97140', '97014', '97112', '97012', '98941') ~ 1,
+      TRUE ~ 0
+    ),
+    is_mental_health = case_when(
+      PROCEDURECODE %in% c('90837', '92507') ~ 1,
+      TRUE ~ 0
+    ),
+    is_diagnostic_lab = case_when(
+      PROCEDURECODE %in% c('85025', '80053', '80061', '80050', '83036', '80048', '84443', '82306', '36415', '96372') ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  select(
+    # DiD variables
+    treatment, post, treat_post,
+    
+    # Demographics
+    age_group,                  
+    family_size_bins,          
+    comorbid_bins,             
+    PATIENTGENDER,             
+    
+    # Plan characteristics
+    DEDUCTIBLE_CATEGORY,       
+    CP_AMT_T1,                 
+    CP_AMT_T2,                 
+    CP_AMT_T3,                 
+    hsa_ind,                   
+    
+    # Visit Costs
+    BILLEDAMOUNT,
+    ALLOWEDAMOUNT,
+    PAIDAMOUNT,
+    COINSURANCEAMOUNT,
+    COPAYAMOUNT,
+    DEDUCTIBLEAMOUNT,
+    
+    # Plan Year
+    Plan_year,
+    
+    # Outcome variables
+    is_primary_care,
+    is_physical_therapy,
+    is_mental_health,
+    is_diagnostic_lab
+  )
+
+library(dplyr)
+library(stringr)
+
+# Step 1: Remove .x columns
+final_analytical_dataset <- merged_data %>%
+  select(-matches("\\.x$"))
+
+# Step 2: Remove .y suffix from remaining columns
+colnames(final_analytical_dataset) <- gsub("\\.y$", "", colnames(final_analytical_dataset))
+
+# Let's check what we have
+str(final_analytical_dataset)
+head(colnames(final_analytical_dataset))
+
+# Check for any remaining duplicate columns
+duplicated_cols <- colnames(final_analytical_dataset)[duplicated(colnames(final_analytical_dataset))]
+print("Duplicated columns:")
+print(duplicated_cols)
+
+# 4. DiD Analysis---- 
+library(MASS)
+library(margins)
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+
+start.time <- Sys.time()
+# Primary Care Visits
+pcp_nb <- glm.nb(is_primary_care ~ treatment*post + 
+                   age_group + family_size_bins + comorbid_bins + 
+                   PATIENTGENDER + DEDUCTIBLE_CATEGORY + 
+                   CP_AMT_T1 + CP_AMT_T2 + CP_AMT_T3 + 
+                   hsa_ind + factor(Plan_year), 
+                 data = final_analytical_dataset)
+
+# Physical Therapy Visits
+pt_nb <- glm.nb(is_physical_therapy ~ treatment*post + 
+                  age_group + family_size_bins + comorbid_bins + 
+                  PATIENTGENDER + DEDUCTIBLE_CATEGORY + 
+                  CP_AMT_T1 + CP_AMT_T2 + CP_AMT_T3 + 
+                  hsa_ind + factor(Plan_year), 
+                data = final_analytical_dataset)
+
+# Mental Health Visits
+mh_nb <- glm.nb(is_mental_health ~ treatment*post + 
+                  age_group + family_size_bins + comorbid_bins + 
+                  PATIENTGENDER + DEDUCTIBLE_CATEGORY + 
+                  CP_AMT_T1 + CP_AMT_T2 + CP_AMT_T3 + 
+                  hsa_ind + factor(Plan_year), 
+                data = final_analytical_dataset)
+
+# Diagnostic Lab Visits
+lab_nb <- glm.nb(is_diagnostic_lab ~ treatment*post + 
+                   age_group + family_size_bins + comorbid_bins + 
+                   PATIENTGENDER + DEDUCTIBLE_CATEGORY + 
+                   CP_AMT_T1 + CP_AMT_T2 + CP_AMT_T3 + 
+                   hsa_ind + factor(Plan_year), 
+                 data = final_analytical_dataset)
+
+# View summary of results
+summary(pcp_nb)
+summary(pt_nb)
+summary(mh_nb)
+summary(lab_nb)
+
+end.time <- Sys.time()
+end.time-start.time
+beep(8)
