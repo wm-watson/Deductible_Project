@@ -705,153 +705,519 @@ claims_elix_age_fam <- claims_with_elix_age %>%
 save(claims_elix_age_fam, file = paste0(filepath, "claims_elix_age_fam.RData"))
 load(paste0(filepath, "claims_elix_age_fam.RData"))
 
+treat_claims <- claims_elix_age_fam
+
 #### 4. Benefit Information----
-library(tidyverse)
-library(data.table)
+##### 4.a.1 Raw Data-----
+amiba_raw <- read_csv("AMIBA_Ben_Pckgs.csv")
+amiha_raw <- read_csv("AMIHA_Ben_Pckgs.csv")
 
+# Clean amiba dataset
+amiba_cleaned <- amiba_raw %>%
+  select(
+    MVDID,
+    MEMBERID,
+    GROUP_NBR,
+    BENEFIT_PKG = BENEFIT_PKG...4,
+    EFF_DATE,
+    TERM_DATE,
+    VOID,
+    DEDUCTIBLE,
+    CP_AMT_T1,
+    CP_AMT_T2,
+    CP_AMT_T3
+  ) %>%
+  mutate(
+    EFF_DATE = as.Date(EFF_DATE),
+    TERM_DATE = as.Date(TERM_DATE),
+    Year = year(EFF_DATE)
+  ) %>%
+  filter(
+    Year >= 2016,
+    Year <= 2023,
+    is.na(VOID) | VOID == 0
+  )
 
-# Column specifications
-col_types_benefits <- cols(
-  MVDID = col_character(),
-  MEMBERID = col_character(),
-  GROUP_NBR = col_character(),
-  BENEFIT_PKG = col_character(),
-  DEDUCTIBLE = col_character(),
-  CP_AMT_T1 = col_character(),
-  CP_AMT_T2 = col_character(),
-  CP_AMT_T3 = col_character(),
-  EFF_DATE = col_date(),
-  TERM_DATE = col_date()
+# Clean amiha dataset
+amiha_cleaned <- amiha_raw %>%
+  select(
+    MVDID,
+    MEMBERID,
+    GROUP_NBR = GROUP_NBR...8,
+    BENEFIT_PKG = BENEFIT_PKG...4,
+    EFF_DATE,
+    TERM_DATE,
+    VOID,
+    DEDUCTIBLE,
+    CP_AMT_T1,
+    CP_AMT_T2,
+    CP_AMT_T3
+  ) %>%
+  mutate(
+    EFF_DATE = as.Date(EFF_DATE),
+    TERM_DATE = as.Date(TERM_DATE),
+    Year = year(EFF_DATE)
+  ) %>%
+  filter(
+    Year >= 2016,
+    Year <= 2023,
+    is.na(VOID) | VOID == 0
+  )
+
+# Analyze each dataset separately with added cost fields
+amiba_summary <- amiba_cleaned %>%
+  group_by(Year) %>%
+  summarise(
+    n_records = n(),
+    n_mvdids = n_distinct(MVDID),
+    n_groups = n_distinct(GROUP_NBR),
+    avg_duration = mean(as.numeric(TERM_DATE - EFF_DATE), na.rm = TRUE),
+    med_deductible = median(as.numeric(DEDUCTIBLE), na.rm = TRUE),
+    med_cp1 = median(as.numeric(CP_AMT_T1), na.rm = TRUE),
+    med_cp2 = median(as.numeric(CP_AMT_T2), na.rm = TRUE),
+    med_cp3 = median(as.numeric(CP_AMT_T3), na.rm = TRUE)
+  )
+
+amiha_summary <- amiha_cleaned %>%
+  group_by(Year) %>%
+  summarise(
+    n_records = n(),
+    n_mvdids = n_distinct(MVDID),
+    n_groups = n_distinct(GROUP_NBR),
+    avg_duration = mean(as.numeric(TERM_DATE - EFF_DATE), na.rm = TRUE),
+    med_deductible = median(as.numeric(DEDUCTIBLE), na.rm = TRUE),
+    med_cp1 = median(as.numeric(CP_AMT_T1), na.rm = TRUE),
+    med_cp2 = median(as.numeric(CP_AMT_T2), na.rm = TRUE),
+    med_cp3 = median(as.numeric(CP_AMT_T3), na.rm = TRUE)
+  )
+
+print("AMIBA Summary:")
+print(amiba_summary)
+print("\nAMIHA Summary:")
+print(amiha_summary)
+
+# Rest of overlap analysis remains the same
+overlap_analysis <- inner_join(
+  amiba_cleaned %>% distinct(MVDID) %>% mutate(in_amiba = TRUE),
+  amiha_cleaned %>% distinct(MVDID) %>% mutate(in_amiha = TRUE),
+  by = "MVDID"
 )
 
-# Improved amount conversion function
-convert_amount <- function(x, field_type) {
-  numeric_value <- as.numeric(x)
-  final_value <- numeric_value
-  final_value[numeric_value == 999999999] <- 0
-  
-  if(field_type == "DEDUCTIBLE") {
-    # Convert cents to dollars for deductibles
-    cents_pattern <- final_value >= 100000 & final_value <= 5000000
-    final_value[cents_pattern] <- final_value[cents_pattern] / 100
-    # Cap unreasonable deductibles
-    final_value[final_value > 50000] <- NA
-  } else {
-    # Copay conversion patterns
-    conversion_rules <- list(
-      CP_AMT_T1 = list(min = 1000, max = 5000, div = 100, cap = 50),
-      CP_AMT_T2 = list(min = 1500, max = 7500, div = 100, cap = 75),
-      CP_AMT_T3 = list(min = 2500, max = 10000, div = 100, cap = 500)
-    )
-    
-    if(field_type %in% names(conversion_rules)) {
-      rule <- conversion_rules[[field_type]]
-      cents_pattern <- final_value >= rule$min & 
-        final_value <= rule$max & 
-        final_value %% (rule$div) == 0
-      final_value[cents_pattern] <- final_value[cents_pattern] / 100
-      final_value[final_value > rule$cap] <- NA
-    }
-  }
-  return(final_value)
-}
+print("\nNumber of MVDIDs appearing in both datasets:")
+print(nrow(overlap_analysis))
 
-# Clean and combine files
-clean_benefits <- function(file_path, platform) {
-  # Read the raw data first to examine column names
-  raw_data <- read_csv(file_path, col_types = col_types_benefits)
-  
-  # Find the correct column names
-  group_nbr_col <- names(raw_data)[grep("GROUP_NBR", names(raw_data))][1]
-  benefit_pkg_col <- names(raw_data)[grep("BENEFIT_PKG", names(raw_data))][1]
-  
-  raw_data %>%
-    select(
-      MVDID,
-      MEMBERID,
-      GROUP_NBR = !!sym(group_nbr_col),
-      BENEFIT_PKG = !!sym(benefit_pkg_col),
-      DEDUCTIBLE,
-      PCP_COPAY = CP_AMT_T1,
-      SPECIALIST_COPAY = CP_AMT_T2,
-      ER_COPAY = CP_AMT_T3,
-      EFF_DATE,
-      TERM_DATE
-    ) %>%
+##### 4.a.2 Clean effective dates----
+# Clean the benefits data with adjusted TERM_DATEs
+benefits_cleaned <- bind_rows(
+  amiba_cleaned %>% 
     mutate(
-      DEDUCTIBLE = convert_amount(DEDUCTIBLE, "DEDUCTIBLE"),
-      PCP_COPAY = convert_amount(PCP_COPAY, "CP_AMT_T1"),
-      SPECIALIST_COPAY = convert_amount(SPECIALIST_COPAY, "CP_AMT_T2"),
-      ER_COPAY = convert_amount(ER_COPAY, "CP_AMT_T3"),
-      Platform = platform,
-      Year = year(EFF_DATE)
+      dataset = "amiba",
+      TERM_DATE = if_else(TERM_DATE == as.Date("9999-12-31"),
+                          EFF_DATE + years(1),
+                          TERM_DATE)
+    ),
+  amiha_cleaned %>% 
+    mutate(
+      dataset = "amiha",
+      TERM_DATE = if_else(TERM_DATE == as.Date("9999-12-31"),
+                          EFF_DATE + years(1),
+                          TERM_DATE)
     )
-}
-
-# Process files
-message("Reading benefit files...")
-combined_benefits <- bind_rows(
-  clean_benefits("AMIBA_Ben_Pckgs.csv", "AMIBA"),
-  clean_benefits("AMIHA_Ben_Pckgs.csv", "AMIHA")
 ) %>%
-  # Remove redundant 9999-12-31 records
-  group_by(MVDID) %>%
-  filter(!(TERM_DATE == as.Date("9999-12-31") & 
-             any(TERM_DATE < as.Date("9999-12-31")))) %>%
-  ungroup() %>%
-  # Add validation flags
   mutate(
-    invalid_deductible = DEDUCTIBLE > 50000 | DEDUCTIBLE < 0,
-    invalid_pcp = PCP_COPAY > 50 | PCP_COPAY < 0,
-    invalid_specialist = SPECIALIST_COPAY > 75 | SPECIALIST_COPAY < 0,
-    invalid_er = ER_COPAY > 500 | ER_COPAY < 0
+    term_year = year(TERM_DATE),
+    duration_days = as.numeric(TERM_DATE - EFF_DATE)
   )
 
-# Generate summary statistics
-summary_stats <- combined_benefits %>%
+# Summary after cleaning with cost fields
+cleaned_summary <- benefits_cleaned %>%
+  group_by(dataset, Year) %>%
   summarise(
-    total_records = n(),
-    unique_mvids = n_distinct(MVDID),
-    year_range = paste(min(Year), "-", max(Year)),
-    across(c(DEDUCTIBLE, PCP_COPAY, SPECIALIST_COPAY, ER_COPAY),
-           list(
-             median = ~median(., na.rm = TRUE),
-             mean = ~mean(., na.rm = TRUE),
-             missing = ~sum(is.na(.))
-           ))
+    n_records = n(),
+    n_mvdids = n_distinct(MVDID),
+    avg_duration = mean(duration_days),
+    med_duration = median(duration_days),
+    med_deductible = median(as.numeric(DEDUCTIBLE), na.rm = TRUE),
+    med_cp1 = median(as.numeric(CP_AMT_T1), na.rm = TRUE),
+    med_cp2 = median(as.numeric(CP_AMT_T2), na.rm = TRUE),
+    med_cp3 = median(as.numeric(CP_AMT_T3), na.rm = TRUE)
   )
 
-# Display summary
-print(summary_stats)
+print("Summary after cleaning:")
+print(cleaned_summary)
 
-# Save cleaned data
-fwrite(combined_benefits, "cleaned_benefits.csv")
+# Clean benefits data with additional date fixes
+benefits_cleaned_v2 <- bind_rows(
+  amiba_cleaned %>% 
+    mutate(
+      dataset = "amiba",
+      TERM_DATE = if_else(year(TERM_DATE) > 2030,
+                          EFF_DATE + years(1),
+                          TERM_DATE)
+    ),
+  amiha_cleaned %>% 
+    mutate(
+      dataset = "amiha",
+      TERM_DATE = if_else(year(TERM_DATE) > 2030,
+                          EFF_DATE + years(1),
+                          TERM_DATE)
+    )
+) %>%
+  mutate(
+    term_year = year(TERM_DATE),
+    duration_days = as.numeric(TERM_DATE - EFF_DATE)
+  )
 
-# Display validation summary
-message("\nValidation Summary:")
-print(combined_benefits %>%
-        summarise(
-          invalid_records = sum(invalid_deductible | invalid_pcp | 
-                                  invalid_specialist | invalid_er, na.rm = TRUE),
-          invalid_deductible = sum(invalid_deductible, na.rm = TRUE),
-          invalid_pcp = sum(invalid_pcp, na.rm = TRUE),
-          invalid_specialist = sum(invalid_specialist, na.rm = TRUE),
-          invalid_er = sum(invalid_er, na.rm = TRUE)
-        ))
+# Verify the cleaning worked, including cost fields
+verification <- benefits_cleaned_v2 %>%
+  group_by(dataset, Year) %>%
+  summarise(
+    max_term_year = max(year(TERM_DATE)),
+    max_duration = max(duration_days),
+    avg_duration = mean(duration_days),
+    med_duration = median(duration_days),
+    med_deductible = median(as.numeric(DEDUCTIBLE), na.rm = TRUE),
+    med_cp1 = median(as.numeric(CP_AMT_T1), na.rm = TRUE),
+    med_cp2 = median(as.numeric(CP_AMT_T2), na.rm = TRUE),
+    med_cp3 = median(as.numeric(CP_AMT_T3), na.rm = TRUE)
+  )
+
+print("Verification after additional cleaning:")
+print(verification)
 beep(8)
 
-#### 5. Combine Benefits Info----
+##### 4.a.3 Split Benefits packages yearly----
+# First separate long and normal duration records
+long_records <- benefits_cleaned_v2 %>%
+  filter(duration_days > 500)
 
-# Rename Year
-clean_ben_hsa_mod <- clean_ben_hsa %>%
-  rename(Plan_year = Year) %>%
-  select(-MEMBERID) # Remove duplicate column
+normal_records <- benefits_cleaned_v2 %>%
+  filter(duration_days <= 500)
 
-# Join on both MVDID and Plan_year
-treatment_claims_final <- claims_elix_age_fam %>%
-  left_join(clean_ben_hsa_mod,
-            by = c("MVDID", "Plan_year"),
-            suffix = c("", "_ben"))
+# Updated function to split a single record
+split_record <- function(row) {
+  dates <- seq(row$EFF_DATE, row$TERM_DATE, by="year")
+  tibble(
+    MVDID = row$MVDID,
+    MEMBERID = row$MEMBERID,
+    BENEFIT_PKG = row$BENEFIT_PKG,
+    GROUP_NBR = row$GROUP_NBR,
+    dataset = row$dataset,
+    EFF_DATE = dates[-length(dates)],
+    TERM_DATE = dates[-1],
+    original_term = row$TERM_DATE,
+    DEDUCTIBLE = row$DEDUCTIBLE,
+    CP_AMT_T1 = row$CP_AMT_T1,
+    CP_AMT_T2 = row$CP_AMT_T2,
+    CP_AMT_T3 = row$CP_AMT_T3
+  )
+}
+
+# Process long records
+long_records_split <- long_records %>%
+  split(1:nrow(.)) %>%
+  map_dfr(split_record)
+
+# Combine split records with normal records
+benefits_cleaned_v3 <- bind_rows(
+  normal_records,
+  long_records_split
+) %>%
+  mutate(
+    Year = year(EFF_DATE),
+    term_year = year(TERM_DATE),
+    duration_days = as.numeric(TERM_DATE - EFF_DATE)
+  )
+
+# Print summary of changes
+print("Records processed:")
+print(paste("Original total:", nrow(benefits_cleaned_v2)))
+print(paste("Records split:", nrow(long_records)))
+print(paste("New total:", nrow(benefits_cleaned_v3)))
+
+# Final verification including cost fields
+verification_v3 <- benefits_cleaned_v3 %>%
+  group_by(dataset, Year) %>%
+  summarise(
+    n_records = n(),
+    max_duration = max(duration_days),
+    avg_duration = mean(duration_days),
+    med_duration = median(duration_days),
+    med_deductible = median(as.numeric(DEDUCTIBLE), na.rm = TRUE),
+    med_cp1 = median(as.numeric(CP_AMT_T1), na.rm = TRUE),
+    med_cp2 = median(as.numeric(CP_AMT_T2), na.rm = TRUE),
+    med_cp3 = median(as.numeric(CP_AMT_T3), na.rm = TRUE)
+  )
+
+print("\nVerification after splitting long durations:")
+print(verification_v3)
+beep(8)
+
+##### 4.b.1 Copays and Deduc----
+# Create mapping dictionaries for each type
+deductible_map <- c(
+  "999999999" = 0,
+  "001000000" = 10000,
+  "000500000" = 5000,
+  "005000000" = 5000,    # Fixed from 50000
+  "000200000" = 2000,
+  "000300000" = 3000,
+  "000600000" = 6000,
+  "000135000" = 1350,
+  "000250000" = 2500,
+  "000120000" = 1200,
+  "000240000" = 2400,
+  "000400000" = 4000,
+  "000170000" = 1700,
+  "000435000" = 4350,
+  "000360000" = 3600,
+  "000270000" = 2700,
+  "000075000" = 750,
+  "000040000" = 400,
+  "000260000" = 2600,
+  "000470000" = 4700,
+  "000350000" = 3500,
+  "000165000" = 1650,
+  "000060000" = 600,
+  "000000200" = 200,    # Fixed from 2
+  "000020000" = 200,
+  "000005000" = 5000,   # Fixed from 50
+  "000027500" = 2750,   # Fixed from 275
+  "000087500" = 8750,   # Fixed from 875
+  "000002500" = 250,    # Fixed from 25
+  "000001500" = 150,    # Fixed from 15
+  "000150000" = 1500,
+  "000100000" = 1000,
+  "000375000" = 3750,
+  "000010000" = 1000,   # Fixed from 100
+  "000022500" = 2250,   # Fixed from 225
+  "000030000" = 3000,   # Fixed from 300
+  "000012500" = 1250,   # Fixed from 125
+  "000017500" = 1750,   # Fixed from 175
+  "000140000" = 1400,
+  "000003000" = 3000,   # Fixed from 30
+  "000130000" = 1300,
+  "000345000" = 3450,
+  "000625000" = 6250,
+  "000675000" = 6750,
+  "000550000" = 5500,
+  "000015000" = 1500,   # Fixed from 150
+  "000365000" = 3650,
+  "000355000" = 3550,
+  "000450000" = 4500,
+  "000387500" = 3875,
+  "000320000" = 3200,
+  "000070000" = 700,
+  "000430000" = 4300,
+  "000280000" = 2800,
+  "000290000" = 2900,
+  "000665000" = 6650,
+  "000855000" = 8550,
+  "000700000" = 7000,
+  "000660000" = 6600,
+  "000011000" = 1100,   # Fixed from 110
+  "000007500" = 750,    # Fixed from 75
+  "000011500" = 1150,   # Fixed from 115
+  "000750000" = 7500,
+  "000685000" = 6850,
+  "000125000" = 1250,
+  "000162500" = 1625,
+  "000180000" = 1800,
+  "000690000" = 6900,
+  "000640000" = 6400,
+  "000062500" = 6250,
+  "000800000" = 8000,
+  "000147500" = 1475,
+  "000715000" = 7150,
+  "000190000" = 1900,
+  "000705000" = 7050,
+  "000025000" = 2500,   # Fixed from 250
+  "000050000" = 5000,   # Fixed from 500
+  "000006000" = 6000,   # Fixed from 60
+  "000045000" = 4500,   # Fixed from 450
+  "000275000" = 2750,
+  "000272500" = 2725,
+  "000066000" = 6600,   # Fixed from 660
+  "000425000" = 4250,
+  "000005500" = 550,    # Fixed from 55
+  "000036000" = 3600,   # Fixed from 360
+  "000006350" = 6350,
+  "000635000" = 6350,
+  "000087000" = 8700,   # Fixed from 870
+  "000082500" = 8250,   # Fixed from 825
+  "000085000" = 8500,   # Fixed from 850
+  "000475000" = 4750,
+  "000002000" = 2000,   # Fixed from 20
+  "000000500" = 500,    # Fixed from 5
+  "000370000" = 3700,
+  "000001000" = 1000,   # Fixed from 10
+  "000067500" = 6750,   # Fixed from 675
+  "000035000" = 3500,   # Fixed from 350
+  "000037500" = 3750,   # Fixed from 375
+  "000002400" = 2400,   # Fixed from 24
+  "000000250" = 250     # Fixed from 2.50
+)
+
+pcp_copay_map <- c(
+  "000001000" = 10,
+  "000001500" = 15,
+  "000002000" = 20,
+  "999999999" = 0,
+  "000000000" = 0,
+  "000000500" = 5,
+  "000000015" = 15,
+  "000001700" = 17,
+  "000000020" = 20,
+  "000020000" = 200,
+  "000002500" = 25,
+  "000004000" = 40,
+  "000000010" = 10,
+  "000003000" = 30,
+  "000000400" = 4,
+  "000000004" = 4,
+  "000000700" = 7,
+  "000001200" = 12,
+  "000015000" = 150,
+  "000000600" = 6,
+  "000000470" = 4.70,
+  "000000025" = 25
+)
+
+specialist_copay_map <- c(
+  "000004000" = 40,
+  "000003000" = 30,
+  "000003500" = 35,
+  "000004500" = 45,
+  "000005000" = 50,
+  "999999999" = 0,
+  "000002500" = 25,
+  "000001500" = 15,
+  "000001000" = 10,
+  "000002000" = 20,
+  "000005500" = 55,
+  "000000035" = 35,
+  "000000045" = 45,
+  "000000050" = 50,
+  "000006000" = 60,
+  "000000500" = 5,
+  "000000040" = 40,
+  "000006500" = 65,
+  "000000030" = 30,
+  "000000400" = 4,
+  "000000000" = 0,
+  "000000004" = 4,
+  "000007500" = 75,
+  "000025000" = 250,
+  "000008000" = 80,
+  "000000700" = 7,
+  "000000470" = 4.70,
+  "000000055" = 55
+)
+
+ed_copay_map <- c(
+  "000006000" = 60,
+  "000005000" = 50,
+  "000005500" = 55,
+  "000006500" = 65,
+  "000007000" = 70,
+  "999999999" = 0,
+  "000007500" = 75,
+  "000004500" = 45,
+  "000003000" = 30,
+  "000008000" = 80,
+  "000000055" = 55,
+  "000004000" = 40,
+  "000000065" = 65,
+  "000000070" = 70,
+  "000008500" = 85,
+  "000010000" = 100,
+  "000012000" = 120,
+  "000009000" = 90,
+  "000013000" = 130,
+  "000000075" = 75,
+  "000000050" = 50,
+  "000013500" = 135,
+  "000015000" = 150,
+  "000000800" = 800,   # Changed from 8 to 800
+  "000000000" = 0,
+  "000000008" = 8,
+  "000000400" = 400,   # Changed from 4 to 400
+  "000002000" = 20,
+  "000016100" = 161,
+  "000016000" = 160,
+  "000003500" = 35,
+  "000002500" = 25,
+  "000001500" = 15,
+  "000000060" = 60,
+  "000000940" = 940,   # Changed from 9.40 to 940
+  "000011000" = 110,
+  "000000090" = 90
+)
+
+# The rest of the code remains the same, but let's adjust the range check for ED copays:
+
+benefits_cleaned_v4 <- benefits_cleaned_v3 %>%
+  mutate(
+    DEDUCTIBLE = deductible_map[DEDUCTIBLE],
+    CP_AMT_T1 = pcp_copay_map[CP_AMT_T1],
+    CP_AMT_T2 = specialist_copay_map[CP_AMT_T2],
+    CP_AMT_T3 = ed_copay_map[CP_AMT_T3]
+  )
+
+# Add reasonable range checks
+benefits_cleaned_v4 <- benefits_cleaned_v4 %>%
+  mutate(
+    DEDUCTIBLE = if_else(DEDUCTIBLE < 0 | DEDUCTIBLE > 10000, NA_real_, DEDUCTIBLE),
+    CP_AMT_T1 = if_else(CP_AMT_T1 < 0 | CP_AMT_T1 > 250, NA_real_, CP_AMT_T1),
+    CP_AMT_T2 = if_else(CP_AMT_T2 < 0 | CP_AMT_T2 > 250, NA_real_, CP_AMT_T2),
+    CP_AMT_T3 = if_else(CP_AMT_T3 < 0 | CP_AMT_T3 > 1000, NA_real_, CP_AMT_T3)  # Updated max to 1000
+  )
+
+# Verify the cleaning
+verification_costs <- benefits_cleaned_v4 %>%
+  summarise(
+    deduct_min = min(DEDUCTIBLE, na.rm = TRUE),
+    deduct_max = max(DEDUCTIBLE, na.rm = TRUE),
+    deduct_median = median(DEDUCTIBLE, na.rm = TRUE),
+    deduct_zero = sum(DEDUCTIBLE == 0, na.rm = TRUE),
+    deduct_na = sum(is.na(DEDUCTIBLE)),
+    
+    pcp_min = min(CP_AMT_T1, na.rm = TRUE),
+    pcp_max = max(CP_AMT_T1, na.rm = TRUE),
+    pcp_median = median(CP_AMT_T1, na.rm = TRUE),
+    pcp_zero = sum(CP_AMT_T1 == 0, na.rm = TRUE),
+    pcp_na = sum(is.na(CP_AMT_T1)),
+    
+    spec_min = min(CP_AMT_T2, na.rm = TRUE),
+    spec_max = max(CP_AMT_T2, na.rm = TRUE),
+    spec_median = median(CP_AMT_T2, na.rm = TRUE),
+    spec_zero = sum(CP_AMT_T2 == 0, na.rm = TRUE),
+    spec_na = sum(is.na(CP_AMT_T2)),
+    
+    ed_min = min(CP_AMT_T3, na.rm = TRUE),
+    ed_max = max(CP_AMT_T3, na.rm = TRUE),
+    ed_median = median(CP_AMT_T3, na.rm = TRUE),
+    ed_zero = sum(CP_AMT_T3 == 0, na.rm = TRUE),
+    ed_na = sum(is.na(CP_AMT_T3))
+  )
+
+print("Verification of cleaned cost fields:")
+print(verification_costs)
+beep(8)
+
+saveRDS(benefits_cleaned_v4, "benefits_cleaned_v4.RDS")
+
+##### 4.c.1 HSA----
+HSA_net <- read_csv("HSA_Network.csv")
+
+HSA_net <- HSA_net %>% 
+  mutate(HSA_CD = if_else(is.na(HSA_CD) | HSA_CD == "11753", 0, 1))
+
+HSA_net <- HSA_net %>% 
+  rename(HSA_Flag = HSA_CD)
+
+HSA_net <- HSA_net %>% 
+  select(-c("NET_TYPE_CD", "NET_TYPE_DESC"))
 
 ### D. Control/Claims----
 #### 1. Elixhauser Comorbidities ----
@@ -940,9 +1306,49 @@ summary_stats <- control_claims_final %>%
     n_mvids = n_distinct(MVDID),
     avg_comorbidities = mean(tot_comorbidities, na.rm = TRUE),
     avg_family_size = mean(new_fam_size, na.rm = TRUE),
-    pct_hsa = mean(hsa_ind, na.rm = TRUE) * 100
+    pct_hsa = mean(HSA_flag, na.rm = TRUE) * 100
   )
 print(summary_stats)
+
+### E. Bens to Cohorts----
+#### e1. Control Cohort----
+# First, standardize the column names and select relevant variables
+control_claims_matched <- control_claims_final %>%
+  select(
+    # Keep core identifiers
+    MVDID, MEMBERID, COMPANY_KEY, SUBGROUPKEY,
+    # Keep claim-specific info
+    SERVICEFROMDATE, PAIDAMOUNT, DEDUCTIBLEAMOUNT, COPAYAMOUNT, COINSURANCEAMOUNT,
+    # Add clinical info
+    PROCEDURECODE, MOD1, CODEVALUE, PATIENTGENDER,
+    # Keep benefit-related info
+    EFF_DATE, TERM_DATE, Platform, GROUP_NBR,
+    # Keep analytical variables
+    control_group, period, period_type, tot_comorbidities,
+    age_group, family_size_bins, hsa_ind
+  )
+
+# Join with benefits data using business keys
+combined_data <- control_claims_matched %>%
+  inner_join(joined_data, 
+             by = c("MVDID", 
+                    "MEMBERID",
+                    "GROUP_NBR",
+                    "COMPANY_KEY" = "COMPANYKEY"),  # Changed from COMPANYKEY to COMPANY_KEY
+             suffix = c("_claims", "_benefits")) %>%
+  # Ensure claims fall within benefit coverage period
+  filter(SERVICEFROMDATE >= EFF_DATE_benefits,
+         SERVICEFROMDATE <= TERM_DATE_benefits) %>%
+  # Handle potential benefit changes within coverage period
+  arrange(MVDID, GROUP_NBR, SERVICEFROMDATE) %>%
+  group_by(MVDID, GROUP_NBR) %>%
+  mutate(
+    hsa_match = hsa_ind == HSA_flag,
+    benefit_period = interval(EFF_DATE_benefits, TERM_DATE_benefits),
+    gap_days = as.numeric(difftime(lead(EFF_DATE_benefits), TERM_DATE_benefits, units = "days"))
+  )
+
+
 
 # 3. Prepare for DiD----
 ## A. Clean and standardize columns----
