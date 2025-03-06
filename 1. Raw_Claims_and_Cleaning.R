@@ -513,7 +513,8 @@ beep(8)
 
 ## C. Treatment/Claims----
 library(lubridate)
-library(tidyverse)
+library(data.table)
+library(readr)
 library(beepr)
 
 # Define column types
@@ -526,48 +527,53 @@ col_types <- cols(
 )
 
 process_chunk <- function(chunk, switcher_mvids, switch_info) {
-  # Process actual claims data
-  processed <- chunk %>%
-    mutate(Plan_year = as.numeric(Plan_year)) %>%
-    filter(MVDID %in% switcher_mvids) %>%
-    left_join(switch_info, by = c("MVDID", "SUBSCRIBERID")) %>%
-    mutate(
-      period = case_when(
-        Plan_year == pre_switch_year ~ "Pre-Switch",
-        Plan_year == switch_year ~ "Switch Year",
-        TRUE ~ "Other"
-      ),
-      period_type = case_when(
-        period == "Pre-Switch" ~ "pre_switch_year",
-        period == "Switch Year" ~ "switch_year"
-      ),
-      switch_type = paste(switch_from, "to", switch_to)
-    ) %>%
-    select(
-      MVDID, SUBSCRIBERID, period_type, Plan_year, period,
-      switch_details, pre_switch_year, switch_year, 
-      switch_from, switch_to, PAIDAMOUNT, switch_type,
-      everything()
-    ) %>%
-    filter(period != "Other")
+  # Convert chunk to data.table and process
+  setDT(chunk)
+  
+  # Filter and join operations
+  chunk[, Plan_year := as.numeric(Plan_year)]    # Fixed := syntax
+  chunk <- chunk[MVDID %in% switcher_mvids]
+  processed <- switch_info[chunk, on = .(MVDID, SUBSCRIBERID)]
+  
+  # Add period columns
+  processed[, `:=`(
+    period = fifelse(Plan_year == pre_switch_year, "Pre-Switch",
+                     fifelse(Plan_year == switch_year, "Switch Year", "Other")),
+    period_type = fifelse(Plan_year == pre_switch_year, "pre_switch_year",
+                          fifelse(Plan_year == switch_year, "switch_year", NA_character_)),
+    switch_type = paste(switch_from, "to", switch_to)
+  )]
+  
+  # Filter out "Other" periods
+  processed <- processed[period != "Other"]
+  
+  # Reorder columns
+  setcolorder(processed, c("MVDID", "SUBSCRIBERID", "period_type", "Plan_year", "period",
+                           "switch_details", "pre_switch_year", "switch_year", 
+                           "switch_from", "switch_to", "PAIDAMOUNT", "switch_type"))
   
   return(processed)
 }
 
 get_switcher_claims_chunked <- function(filepath, switcher_mvids, subscriber_patterns, chunk_size = 1e6) {
-  switch_info <- subscriber_patterns %>%
-    select(SUBSCRIBERID, switch_details, pre_switch_year, switch_year, 
-           switch_from, switch_to, MVDIDs) %>%
-    unnest(cols = c(MVDIDs)) %>%
-    rename(MVDID = MVDIDs)
+  # Convert subscriber_patterns to data.table and prepare switch_info
+  setDT(subscriber_patterns)
+  switch_info <- subscriber_patterns[, .(SUBSCRIBERID, switch_details, pre_switch_year, 
+                                         switch_year, switch_from, switch_to, MVDIDs)]
+  switch_info <- switch_info[, .(MVDID = unlist(MVDIDs)), 
+                             by = .(SUBSCRIBERID, switch_details, pre_switch_year, 
+                                    switch_year, switch_from, switch_to)]
   
-  claims_analyzed <- tibble()
+  # Set keys for faster joins
+  setkey(switch_info, MVDID, SUBSCRIBERID)
+  
+  claims_analyzed <- data.table()
   
   callback <- function(chunk, pos) {
     processed_chunk <- process_chunk(chunk, switcher_mvids, switch_info)
     
     if(nrow(processed_chunk) > 0) {
-      claims_analyzed <<- bind_rows(claims_analyzed, processed_chunk)
+      claims_analyzed <<- rbindlist(list(claims_analyzed, processed_chunk), fill = TRUE)
     }
     print(paste("Processed chunk", pos))
     TRUE
@@ -586,10 +592,8 @@ get_switcher_claims_chunked <- function(filepath, switcher_mvids, subscriber_pat
 # Execute the claims processing
 start.time <- Sys.time()
 
-switcher_mvids <- subscriber_patterns %>%
-  unnest(cols = c(MVDIDs)) %>%
-  pull(MVDIDs) %>%
-  unique()
+# Get unique switcher MVDIDs
+switcher_mvids <- unique(unlist(subscriber_patterns$MVDIDs))
 
 print("Number of switcher MVDIDs:")
 print(length(switcher_mvids))
@@ -692,6 +696,7 @@ claims_with_elix_age <- claims_with_elix %>%
                          labels = labels, 
                          include.lowest = TRUE, 
                          right = FALSE))
+
 #### 3. Family Size----
 #Calculate family size and create bins
 claims_elix_age_fam <- claims_with_elix_age %>%
@@ -706,8 +711,9 @@ claims_elix_age_fam <- claims_with_elix_age %>%
 
 
 save(claims_elix_age_fam, file = paste0(filepath, "claims_elix_age_fam.RData"))
-load(paste0(filepath, "claims_elix_age_fam.RData"))
+claims_elix_age_fam <- load(paste0(filepath, "claims_elix_age_fam.RData"))
 
+load("claims_elix_age_fam.RData")
 treat_claims <- claims_elix_age_fam
 
 #### 4. Benefit Information----
@@ -1209,6 +1215,7 @@ print(verification_costs)
 beep(8)
 
 saveRDS(benefits_cleaned_v4, "benefits_cleaned_v4.RDS")
+benefits_cleaned_v4 <- load(paste0(filepath, "benefits_cleaned_v4.RDS"))
 
 ##### 4.c.1 HSA----
 HSA_net <- read_csv("HSA_Network.csv")
@@ -1295,6 +1302,7 @@ imputation_summary <- benefits_final_imputed %>%
 print(imputation_summary)
 
 saveRDS(benefits_final_imputed, "benefits_final_impured.rds")
+benefits_final_imputed <- readRDS(paste0(filepath, "benefits_final_impured.rds"))
 
 #### 5. Treat Claims w/Benefits----
 # 1. Clean benefits data - take most common benefit structure per company/subgroup/year
@@ -1596,7 +1604,12 @@ control_claims_elix_age_fam <- control_claims_with_elix_age %>%
                                 right = FALSE))
 
 #### 4. Combine Claims and Benefits----
-# Add control period imputations
+# First, identify unmatched control claims
+unmatched_control <- control_claims_elix_age_fam %>%
+  select(COMPANY_KEY, SUBGROUPKEY) %>%
+  distinct()
+
+# Then add control period imputations
 control_imputations <- unmatched_control %>%
   distinct(COMPANY_KEY, SUBGROUPKEY) %>%
   mutate(
@@ -1687,10 +1700,15 @@ control_claims_with_benefits_v2 <- control_claims_with_benefits_v2 %>%
   left_join(deductible_mapping, by = "Plan_year") %>%
   mutate(
     DEDUCTIBLE_final = case_when(
-      HSA_Flag_final == 1 ~ recommended_deductible,
+      imputed_hsa_flag == 1 ~ recommended_deductible,
       TRUE ~ 1000  # Keep original non-HSA deductible
     ),
-    Treat_Control_Cohort = 0
+    Treat_Control_Cohort = 0,
+    # Create final copay columns
+    CP_AMT_T1_final = imputed_copay_t1,
+    CP_AMT_T2_final = imputed_copay_t2,
+    CP_AMT_T3_final = imputed_copay_t3,
+    HSA_Flag_final = imputed_hsa_flag
   ) %>%
   select(-recommended_deductible) %>%  # Remove the mapping column
   rename(
@@ -1862,56 +1880,180 @@ print(deductible_summary)
 
 # 3. Prepare for DiD----
 ## A. Utilization categories----
-# STEP 1: CREATE PROCEDURE CATEGORIES
-procedure_categories <- combined_claims %>%
+#Get top 20
+##Filter out NAs----
+df <- combined_claims %>%
+  filter(!is.na(PROCEDURECODE))
+
+##Procedure Codes----
+df <- df %>%
+  group_by(PROCEDURECODE) %>%
+  tally(name = "Count") %>%
+  arrange(desc(Count))
+
+# Get the top 20 procedure codes
+
+top_25 <- df %>%
+  top_n(25)
+
+# View the top 20 procedure codes
+view(top_25)
+
+### Map procedure codes ----
+
+# STEP 1: Combine original and additional mappings for procedure codes
+mapping_1 <- data.frame(
+  PROCEDURECODE = c(
+    # Original procedure codes
+    '99214', '99213', '97110', '97530', '85025', '98941', '36415', '80053',
+    '80061', '99203', '97140', '97014', '92507', '90837', '97112', '80050',
+    '80048', '96372', '83036', '99204',
+    # Newly added procedure codes
+    '81003', '97010', '87804', '99212', '83735', '84439', '95117', '98943',
+    '81001', 'J1100', '97032', '85027', '93005', '88305', '95115', '3074F',
+    '87880', '82607', '97035', '84484',
+    # Top "Other" procedure codes
+    '3078F', '3079F', '3008F', '90686', '96375', '90471', '71045', '71046',
+    '77067', '87086', '87635', '84153', '82728', '84403', '99215',
+    '99232', '99202', '99284', '99285', '99291', '93010', 'Q9967', '80076',
+    '99395', '85652', '85610', '83690', 'J2405'
+  ),
+  procedure_category = c(
+    # Original procedure categories
+    'E_and_M', 'E_and_M', 'PT', 'PT', 'Laboratory', 'Chiropractry', 'Collection', 'Laboratory',
+    'Laboratory', 'E_and_M', 'PT', 'PT', 'Speech_Therapy', 'Mental_Health', 'PT', 'Laboratory',
+    'Laboratory', 'Injection', 'Laboratory', 'E_and_M',
+    # Newly added categories
+    'Laboratory',          # 81003 - Urinalysis
+    'PT',                  # 97010 - Physical Therapy
+    'Laboratory',          # 87804 - Infectious Disease Test
+    'E_and_M',             # 99212 - Evaluation and Management
+    'Laboratory',          # 83735 - Lipid Testing
+    'Laboratory',          # 84439 - Thyroid Testing
+    'Allergy_Treatment',   # 95117 - Allergy Treatment
+    'Chiropractry',        # 98943 - Chiropractic Treatment
+    'Laboratory',          # 81001 - Urinalysis
+    'Injection',           # J1100 - Injection
+    'PT',                  # 97032 - Physical Therapy
+    'Laboratory',          # 85027 - Hematology Testing
+    'Laboratory',          # 93005 - Cardiac Testing
+    'Pathology',           # 88305 - Pathology Testing
+    'Allergy_Treatment',   # 95115 - Allergy Treatment
+    'Quality_Measurement', # 3074F - Quality Measurement
+    'Laboratory',          # 87880 - Infectious Disease Test
+    'Laboratory',          # 82607 - Vitamin Testing
+    'PT',                  # 97035 - Physical Therapy
+    'Laboratory',          # 84484 - Thyroid Testing
+    # Top "Other" procedure categories
+    'Quality_Measurement', 'Quality_Measurement', 'Quality_Measurement', 'Immunization',
+    'Injection', 'Injection', 'Imaging', 'Imaging', 'Imaging', 'Laboratory', 'Laboratory',
+    'Laboratory', 'Laboratory', 'Laboratory', 'E_and_M', 'E_and_M', 'E_and_M',
+    'E_and_M', 'E_and_M', 'E_and_M', 'Cardiac_Testing', 'Contrast_Material', 'Laboratory',
+    'Preventive_Medicine', 'Hematology', 'Hematology', 'Hematology', 'Injection'
+  ),
+  proc_description = c(
+    # Original descriptions
+    'Office visit, established patient, 25 minutes',         # 99214
+    'Office visit, established patient, 15 minutes',         # 99213
+    'Therapeutic exercises to improve strength/motion',      # 97110
+    'Therapeutic activities to improve functional skills',   # 97530
+    'Complete blood count (CBC)',                            # 85025
+    'Chiropractic manipulative treatment (3-4 regions)',     # 98941
+    'Blood collection by venipuncture',                      # 36415
+    'Comprehensive metabolic panel (CMP)',                   # 80053
+    'Lipid panel (cholesterol, HDL, triglycerides)',         # 80061
+    'Office visit, new patient, 30 minutes',                 # 99203
+    'Manual therapy techniques (e.g., mobilization)',        # 97140
+    'Electrical stimulation (unattended)',                  # 97014
+    'Speech and language therapy',                           # 92507
+    'Psychotherapy, 60 minutes',                             # 90837
+    'Neuromuscular reeducation',                             # 97112
+    'General health panel',                                  # 80050
+    'Basic metabolic panel',                                 # 80048
+    'Injection, subcutaneous or intramuscular',              # 96372
+    'Hemoglobin A1c (HbA1c) test for diabetes',              # 83036
+    'Office visit, new patient, 45 minutes',                 # 99204
+    # Newly added descriptions
+    'Urinalysis, non-automated',                              # 81003
+    'Application of hot or cold packs for PT',                # 97010
+    'Rapid infectious agent test (e.g., influenza)',          # 87804
+    'Office visit, established patient, 10 minutes',          # 99212
+    'Lipoprotein particle testing',                           # 83735
+    'Thyroxine (T4) testing',                                 # 84439
+    'Allergy injection without antigen',                      # 95117
+    'Chiropractic manipulative treatment (5 regions)',        # 98943
+    'Urinalysis, automated',                                  # 81001
+    'Injection of corticosteroid or other therapeutic agent', # J1100
+    'Electrical stimulation therapy',                         # 97032
+    'Complete blood count (automated)',                       # 85027
+    'Electrocardiogram (EKG) tracing',                        # 93005
+    'Surgical pathology, gross and microscopic examination',  # 88305
+    'Allergy injection with antigen',                         # 95115
+    'Quality reporting for clinical performance',             # 3074F
+    'Rapid strep test',                                       # 87880
+    'Vitamin D, 25-hydroxy',                                  # 82607
+    'Ultrasound therapy for physical therapy',                # 97035
+    'Thyroid-stimulating hormone (TSH)',                      # 84484
+    # Top "Other" procedure descriptions
+    'Performance measurement for blood pressure',             # 3078F
+    'Performance measurement for BMI',                        # 3079F
+    'Quality reporting for tobacco use',                      # 3008F
+    'Influenza virus vaccine',                                # 90686
+    'Therapeutic, prophylactic, or diagnostic injection',     # 96375
+    'Immunization administration',                            # 90471
+    'Chest X-ray, single view',                               # 71045
+    'Chest X-ray, 2 views',                                   # 71046
+    'Screening mammogram',                                    # 77067
+    'Urine culture, bacterial',                               # 87086
+    'Molecular infectious disease test',                      # 87635
+    'Prostate-specific antigen (PSA)',                        # 84153
+    'Vitamin B12 measurement',                                # 82728
+    'Total T3 testing',                                       # 84403
+    'Office visit, established patient, 40 minutes',          # 99215
+    'Subsequent hospital care, 35 minutes',                   # 99232
+    'Office visit, new patient, 20 minutes',                  # 99202
+    'Emergency department visit',                             # 99284
+    'Critical care, first hour',                              # 99285
+    'Critical care, each additional 30 minutes',              # 99291
+    'Cardiac stress test interpretation',                     # 93010
+    'Low osmolar contrast material',                          # Q9967
+    'Hepatic function panel',                                 # 80076
+    'Preventive medicine, established patient, 18-39 years',  # 99395
+    'Erythrocyte sedimentation rate',                         # 85652
+    'Prothrombin time (PT)',                                  # 85610
+    'Blood lead level',                                       # 83690
+    'Injection of ondansetron'                                # J2405
+  )
+)
+
+# Ensure PROCEDURECODE is a character in both datasets
+combined_claims$PROCEDURECODE <- as.character(combined_claims$PROCEDURECODE)
+mapping_1$PROCEDURECODE <- as.character(mapping_1$PROCEDURECODE)
+
+
+# Join the mapping dataframe to the claims data
+combined_claims <- combined_claims %>%
+  left_join(mapping_1, by = "PROCEDURECODE")
+
+# Handle missing or unmapped claims
+combined_claims <- combined_claims %>%
   mutate(
     procedure_category = case_when(
-      # Anesthesia
-      PROCEDURECODE >= '00100' & PROCEDURECODE <= '01999' ~ 'Anesthesia',
-      
-      # Surgery by section
-      PROCEDURECODE >= '10021' & PROCEDURECODE <= '69990' ~ 'Surgery',
-      
-      # Radiology
-      PROCEDURECODE >= '70010' & PROCEDURECODE <= '79999' ~ 'Radiology',
-      
-      # Pathology/Laboratory
-      PROCEDURECODE >= '80047' & PROCEDURECODE <= '89398' ~ 'Laboratory/Pathology',
-      
-      # Medicine (excluding E&M)
-      PROCEDURECODE >= '90281' & PROCEDURECODE <= '98943' ~ 'Medicine',
-      
-      # E&M Services
-      PROCEDURECODE >= '99201' & PROCEDURECODE <= '99499' ~ 'E&M Services',
-      
-      # Category III codes
-      PROCEDURECODE >= '0001T' & PROCEDURECODE <= '9999T' ~ 'Category III/Temporary',
-      
-      # HCPCS Level II codes
-      substr(PROCEDURECODE, 1, 1) == 'A' ~ 'Medical Supplies/DME',
-      substr(PROCEDURECODE, 1, 1) == 'B' ~ 'Enteral/Parenteral Therapy',
-      substr(PROCEDURECODE, 1, 1) == 'C' ~ 'Temporary Hospital OP Services',
-      substr(PROCEDURECODE, 1, 1) == 'D' ~ 'Dental Procedures',
-      substr(PROCEDURECODE, 1, 1) == 'E' ~ 'Durable Medical Equipment',
-      substr(PROCEDURECODE, 1, 1) == 'G' ~ 'Temporary Procedures/Services',
-      substr(PROCEDURECODE, 1, 1) == 'H' ~ 'Rehabilitative Services',
-      substr(PROCEDURECODE, 1, 1) == 'J' ~ 'Drugs/Biologicals',
-      substr(PROCEDURECODE, 1, 1) == 'K' ~ 'Temporary Codes',
-      substr(PROCEDURECODE, 1, 1) == 'L' ~ 'Orthotic/Prosthetic',
-      substr(PROCEDURECODE, 1, 1) == 'M' ~ 'Medical Services',
-      substr(PROCEDURECODE, 1, 1) == 'P' ~ 'Pathology/Laboratory',
-      substr(PROCEDURECODE, 1, 1) == 'Q' ~ 'Temporary Codes',
-      substr(PROCEDURECODE, 1, 1) == 'R' ~ 'Diagnostic Radiology',
-      substr(PROCEDURECODE, 1, 1) == 'S' ~ 'Private Payer Codes',
-      substr(PROCEDURECODE, 1, 1) == 'T' ~ 'State Medicaid Codes',
-      substr(PROCEDURECODE, 1, 1) == 'V' ~ 'Vision/Hearing Services',
-      TRUE ~ 'Other'
+      is.na(PROCEDURECODE) ~ "Missing",               # Claims with no PROCEDURECODE
+      is.na(procedure_category) ~ "Other",           # Claims not mapped to a category
+      TRUE ~ procedure_category                      # Keep mapped categories
+    ),
+    proc_description = case_when(
+      procedure_category == "Missing" ~ "Missing",                 # Description for missing PROCEDURECODE
+      procedure_category == "Other" ~ "No description available",  # Description for unmapped claims
+      TRUE ~ proc_description                                      # Keep mapped descriptions
     )
   )
 
 # STEP 2: ANALYZE FREQUENCIES BY GROUP AND PERIOD
-utilization_freq <- procedure_categories %>%
-  group_by(Treat_Control_Cohort, post_period, procedure_category) %>%
+# Analyze frequencies by group and period
+utilization_freq <- combined_claims %>%
+  group_by(Treat_Control_Cohort, post_period, procedure_category, proc_description) %>%
   summarise(
     n_claims = n(),
     n_members = n_distinct(MVDID),
@@ -1927,8 +2069,9 @@ utilization_freq <- procedure_categories %>%
   arrange(Treat_Control_Cohort, post_period, -n_claims)
 
 # STEP 3: CALCULATE CHANGES BETWEEN PERIODS
+# Calculate changes between periods
 utilization_changes <- utilization_freq %>%
-  select(Treat_Control_Cohort, post_period, procedure_category, n_claims, pct_of_total) %>%
+  select(Treat_Control_Cohort, post_period, procedure_category, proc_description, n_claims, pct_of_total) %>%
   pivot_wider(
     names_from = post_period,
     values_from = c(n_claims, pct_of_total)
@@ -1946,211 +2089,197 @@ utilization_changes <- utilization_freq %>%
   arrange(Treat_Control_Cohort, -pct_change)
 
 # STEP 4: PRINT RESULTS
+# Print results for each group and period
 # Control Group - Pre
 print("\nControl Group - Pre Period:")
 print(utilization_freq %>% 
         filter(Treat_Control_Cohort == 0, post_period == 0) %>%
-        select(procedure_category, n_claims, pct_of_total, claims_per_member, avg_paid) %>%
+        select(procedure_category, proc_description, n_claims, pct_of_total, claims_per_member, avg_paid) %>%
         arrange(-n_claims))
 
 # Control Group - Post
 print("\nControl Group - Post Period:")
 print(utilization_freq %>% 
         filter(Treat_Control_Cohort == 0, post_period == 1) %>%
-        select(procedure_category, n_claims, pct_of_total, claims_per_member, avg_paid) %>%
+        select(procedure_category, proc_description, n_claims, pct_of_total, claims_per_member, avg_paid) %>%
         arrange(-n_claims))
 
 # Treatment Group - Pre
 print("\nTreatment Group - Pre Period:")
 print(utilization_freq %>% 
         filter(Treat_Control_Cohort == 1, post_period == 0) %>%
-        select(procedure_category, n_claims, pct_of_total, claims_per_member, avg_paid) %>%
+        select(procedure_category, proc_description, n_claims, pct_of_total, claims_per_member, avg_paid) %>%
         arrange(-n_claims))
 
 # Treatment Group - Post
 print("\nTreatment Group - Post Period:")
 print(utilization_freq %>% 
         filter(Treat_Control_Cohort == 1, post_period == 1) %>%
-        select(procedure_category, n_claims, pct_of_total, claims_per_member, avg_paid) %>%
+        select(procedure_category, proc_description, n_claims, pct_of_total, claims_per_member, avg_paid) %>%
         arrange(-n_claims))
 
-# Top 25 Procedures Analysis
-top_25_procedures <- procedure_categories %>%
-  group_by(PROCEDURECODE, procedure_category) %>%
-  summarise(
-    frequency = n(),
-    total_paid = sum(PAIDAMOUNT, na.rm = TRUE),
-    avg_paid = mean(PAIDAMOUNT, na.rm = TRUE),
-    n_members = n_distinct(MVDID),
-    .groups = 'drop'
-  ) %>%
-  arrange(desc(frequency)) %>%
-  head(25)
-
-print("\nTop 25 Procedures:")
-print(top_25_procedures)
-
-# Distribution by treatment group and period
-top_25_by_treatment <- procedure_categories %>%
-  filter(PROCEDURECODE %in% top_25_procedures$PROCEDURECODE) %>%
-  group_by(PROCEDURECODE, procedure_category, Treat_Control_Cohort, post_period) %>%
-  summarise(
-    frequency = n(),
-    avg_paid = mean(PAIDAMOUNT, na.rm = TRUE),
-    n_members = n_distinct(MVDID),
-    .groups = 'drop'
-  ) %>%
-  arrange(PROCEDURECODE, Treat_Control_Cohort, post_period)
-
-print("\nTop 25 Procedures by Treatment Group and Period:")
-print(top_25_by_treatment)
-
-# Average cost per member
-top_25_member_costs <- procedure_categories %>%
-  filter(PROCEDURECODE %in% top_25_procedures$PROCEDURECODE) %>%
-  group_by(PROCEDURECODE, MVDID) %>%
-  summarise(
-    visits_per_member = n(),
-    avg_paid_per_member = mean(PAIDAMOUNT, na.rm = TRUE),
-    .groups = 'drop'
-  ) %>%
-  group_by(PROCEDURECODE) %>%
-  summarise(
-    avg_visits_per_member = mean(visits_per_member),
-    median_visits_per_member = median(visits_per_member),
-    avg_cost_per_member = mean(avg_paid_per_member, na.rm = TRUE),
-    .groups = 'drop'
-  )
-
-print("\nTop 25 Procedures - Member Cost Analysis:")
-print(top_25_member_costs)
 
 ## B. Analytical Dataset----
 final_analytical_dataset <- combined_claims %>%
   mutate(
     # Outcome Variables (Visit Types)
-    is_primary_care = case_when(
-      PROCEDURECODE %in% c('99214', '99213', '99203', '99204', '99396') ~ 1,
+    is_eandem = case_when(
+      procedure_category == "E_and_M" ~ 1,
       TRUE ~ 0
     ),
-    is_physical_therapy = case_when(
-      PROCEDURECODE %in% c('97110', '97530', '97140', '97014', '97112', '97012', '98941') ~ 1,
+    is_pt = case_when(
+      procedure_category == "PT" ~ 1,
+      TRUE ~ 0
+    ),
+    is_laboratory = case_when(
+      procedure_category == "Laboratory" ~ 1,
       TRUE ~ 0
     ),
     is_mental_health = case_when(
-      PROCEDURECODE %in% c('90837', '92507') ~ 1,
+      procedure_category == "Mental_Health" ~ 1,
       TRUE ~ 0
     ),
-    is_diagnostic_lab = case_when(
-      PROCEDURECODE %in% c('85025', '80053', '80061', '80050', '83036', '80048', '84443', '82306', '36415', '96372') ~ 1,
+    is_speech_therapy = case_when(
+      procedure_category == "Speech_Therapy" ~ 1,
+      TRUE ~ 0
+    ),
+    is_immunization = case_when(
+      procedure_category == "Immunization" ~ 1,
+      TRUE ~ 0
+    ),
+    is_preventive = case_when(
+      procedure_category == "Preventive_Medicine" ~ 1,
       TRUE ~ 0
     )
   ) %>%
   select(
-    # Member ID
-    MVDID,
+    # Keep all your existing selection variables, plus new outcome variables
+    MVDID, SUBSCRIBERID, age_group, family_size_bins, comorbid_bins,             
+    PATIENTGENDER, age_at_plan_year_start, tot_comorbidities,
+    DEDUCTIBLE_CATEGORY, PCP_copay, Specialist_copay, ED_copay,
+    DEDUCTIBLE_final, BILLEDAMOUNT, ALLOWEDAMOUNT, PAIDAMOUNT,
+    COINSURANCEAMOUNT, COPAYAMOUNT, DEDUCTIBLEAMOUNT, Plan_year,
+    HSA_Flag_final, Treat_Control_Cohort, post_period, deductible_level,
     
-    # DiD variables
-    Treat_Control_Cohort,
-    post_period,
-    
-    # Demographics
-    age_group,                  
-    family_size_bins,          
-    comorbid_bins,             
-    PATIENTGENDER,             
-    
-    # Plan characteristics
-    DEDUCTIBLE_CATEGORY,       
-    PCP_copay,                 
-    Specialist_copay,          
-    ED_copay,                 
-    HSA_Flag_final,                   
-    
-    # Visit Costs
-    BILLEDAMOUNT,
-    ALLOWEDAMOUNT,
-    PAIDAMOUNT,
-    COINSURANCEAMOUNT,
-    COPAYAMOUNT,
-    DEDUCTIBLEAMOUNT,
-    
-    # Plan Year
-    Plan_year,
-    
-    # Outcome variables
-    is_primary_care,
-    is_physical_therapy,
-    is_mental_health,
-    is_diagnostic_lab
+    # New outcome variables
+    is_eandem, is_pt, is_laboratory, is_mental_health,
+    is_speech_therapy, is_immunization, is_preventive
   )
 
-# Verify the dataset
-summary_stats <- final_analytical_dataset %>%
-  group_by(Treat_Control_Cohort, post_period) %>%
+# Update the yearly utilization calculation
+yearly_utilization <- final_analytical_dataset %>%
+  group_by(MVDID, post_period) %>%
   summarise(
-    n_claims = n(),
-    n_primary_care = sum(is_primary_care),
-    n_physical_therapy = sum(is_physical_therapy),
+    # Keep your existing grouping variables
+    Treat_Control_Cohort = first(Treat_Control_Cohort),
+    Plan_year = first(Plan_year),
+    
+    # Visit counts for new categories
+    n_eandem = sum(is_eandem),
+    n_pt = sum(is_pt),
+    n_laboratory = sum(is_laboratory),
     n_mental_health = sum(is_mental_health),
-    n_diagnostic_lab = sum(is_diagnostic_lab),
-    avg_paid = mean(PAIDAMOUNT, na.rm = TRUE)
+    n_speech_therapy = sum(is_speech_therapy),
+    n_immunization = sum(is_immunization),
+    n_preventive = sum(is_preventive),
+    
+    # Costs by new categories
+    eandem_paid = sum(PAIDAMOUNT * (is_eandem == 1), na.rm = TRUE),
+    eandem_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_eandem == 1), na.rm = TRUE),
+    
+    pt_paid = sum(PAIDAMOUNT * (is_pt == 1), na.rm = TRUE),
+    pt_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_pt == 1), na.rm = TRUE),
+    
+    laboratory_paid = sum(PAIDAMOUNT * (is_laboratory == 1), na.rm = TRUE),
+    laboratory_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_laboratory == 1), na.rm = TRUE),
+    
+    mental_health_paid = sum(PAIDAMOUNT * (is_mental_health == 1), na.rm = TRUE),
+    mental_health_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_mental_health == 1), na.rm = TRUE),
+    
+    speech_therapy_paid = sum(PAIDAMOUNT * (is_speech_therapy == 1), na.rm = TRUE),
+    speech_therapy_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_speech_therapy == 1), na.rm = TRUE),
+    
+    immunization_paid = sum(PAIDAMOUNT * (is_immunization == 1), na.rm = TRUE),
+    immunization_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_immunization == 1), na.rm = TRUE),
+    
+    preventive_paid = sum(PAIDAMOUNT * (is_preventive == 1), na.rm = TRUE),
+    preventive_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_preventive == 1), na.rm = TRUE),
+    
+    # Keep all member characteristics
+    SUBSCRIBERID = first(SUBSCRIBERID),
+    age_group = first(age_group),
+    age_at_plan_year_start = first(age_at_plan_year_start),
+    family_size_bins = first(family_size_bins),
+    tot_comorbidities = first(tot_comorbidities),
+    comorbid_bins = first(comorbid_bins),
+    PATIENTGENDER = first(PATIENTGENDER),
+    deductible_level = first(deductible_level),
+    DEDUCTIBLE_CATEGORY = first(DEDUCTIBLE_CATEGORY),
+    HSA_Flag_final = first(HSA_Flag_final),
+    PCP_copay = first(PCP_copay),
+    Specialist_copay = first(Specialist_copay),
+    ED_copay = first(ED_copay),
+    .groups = 'drop'
   )
-
-print("Summary Statistics by Group and Period:")
-print(summary_stats)
-
-# Check visit type distributions
-visit_dist <- final_analytical_dataset %>%
-  group_by(Treat_Control_Cohort, post_period) %>%
-  summarise(
-    pct_primary_care = mean(is_primary_care) * 100,
-    pct_physical_therapy = mean(is_physical_therapy) * 100,
-    pct_mental_health = mean(is_mental_health) * 100,
-    pct_diagnostic_lab = mean(is_diagnostic_lab) * 100
-  )
-
-print("\nVisit Type Distribution (%):")
-print(visit_dist)
 
 ## C. Yearly Utilization----
-# Calculate yearly utilization and cost measures per member
+#Calculate yearly utilization and cost measures per member
 yearly_utilization <- final_analytical_dataset %>%
-  group_by(
-    # ID variables
-    Treat_Control_Cohort, post_period, Plan_year,
-    
-    # Keep explanatory variables for DiD
-    age_group, family_size_bins, comorbid_bins, PATIENTGENDER,
-    DEDUCTIBLE_CATEGORY, HSA_Flag_final,
-    PCP_copay, Specialist_copay, ED_copay,
-    
-    # Group by MVDID to get member-level data
-    MVDID
-  ) %>%
+  group_by(MVDID, post_period) %>%
   summarise(
+    # Keep treatment status and year
+    Treat_Control_Cohort = first(Treat_Control_Cohort),
+    Plan_year = first(Plan_year),
+    
     # Visit counts
-    n_primary_care = sum(is_primary_care),
-    n_physical_therapy = sum(is_physical_therapy),
+    n_eandem = sum(is_eandem),
+    n_pt = sum(is_pt),
+    n_laboratory = sum(is_laboratory),
     n_mental_health = sum(is_mental_health),
-    n_diagnostic_lab = sum(is_diagnostic_lab),
+    n_speech_therapy = sum(is_speech_therapy),
+    n_immunization = sum(is_immunization),
+    n_preventive = sum(is_preventive),
     
     # Total yearly costs
     total_paid = sum(PAIDAMOUNT, na.rm = TRUE),
     total_oop = sum(COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT, na.rm = TRUE),
     
     # Visit-type specific costs
-    primary_care_paid = sum(PAIDAMOUNT * (is_primary_care == 1), na.rm = TRUE),
-    primary_care_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_primary_care == 1), na.rm = TRUE),
+    eandem_paid = sum(PAIDAMOUNT * (is_eandem == 1), na.rm = TRUE),
+    eandem_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_eandem == 1), na.rm = TRUE),
     
-    phys_therapy_paid = sum(PAIDAMOUNT * (is_physical_therapy == 1), na.rm = TRUE),
-    phys_therapy_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_physical_therapy == 1), na.rm = TRUE),
+    pt_paid = sum(PAIDAMOUNT * (is_pt == 1), na.rm = TRUE),
+    pt_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_pt == 1), na.rm = TRUE),
+    
+    laboratory_paid = sum(PAIDAMOUNT * (is_laboratory == 1), na.rm = TRUE),
+    laboratory_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_laboratory == 1), na.rm = TRUE),
     
     mental_health_paid = sum(PAIDAMOUNT * (is_mental_health == 1), na.rm = TRUE),
     mental_health_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_mental_health == 1), na.rm = TRUE),
     
-    diagnostic_lab_paid = sum(PAIDAMOUNT * (is_diagnostic_lab == 1), na.rm = TRUE),
-    diagnostic_lab_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_diagnostic_lab == 1), na.rm = TRUE),
+    speech_therapy_paid = sum(PAIDAMOUNT * (is_speech_therapy == 1), na.rm = TRUE),
+    speech_therapy_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_speech_therapy == 1), na.rm = TRUE),
+    
+    immunization_paid = sum(PAIDAMOUNT * (is_immunization == 1), na.rm = TRUE),
+    immunization_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_immunization == 1), na.rm = TRUE),
+    
+    preventive_paid = sum(PAIDAMOUNT * (is_preventive == 1), na.rm = TRUE),
+    preventive_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_preventive == 1), na.rm = TRUE),
+    
+    # Member characteristics
+    SUBSCRIBERID = first(SUBSCRIBERID),
+    age_group = first(age_group),
+    age_at_plan_year_start = first(age_at_plan_year_start),
+    family_size_bins = first(family_size_bins),
+    tot_comorbidities = first(tot_comorbidities),
+    comorbid_bins = first(comorbid_bins),
+    PATIENTGENDER = first(PATIENTGENDER),
+    deductible_level = first(deductible_level),
+    DEDUCTIBLE_CATEGORY = first(DEDUCTIBLE_CATEGORY),
+    HSA_Flag_final = first(HSA_Flag_final),
+    PCP_copay = first(PCP_copay),
+    Specialist_copay = first(Specialist_copay),
+    ED_copay = first(ED_copay),
     .groups = 'drop'
   )
 
@@ -2159,90 +2288,83 @@ summary_stats <- yearly_utilization %>%
   group_by(Treat_Control_Cohort, post_period) %>%
   summarise(
     n_members = n_distinct(MVDID),
+    
     # Visit counts
-    avg_primary_care = mean(n_primary_care),
-    avg_physical_therapy = mean(n_physical_therapy),
-    avg_mental_health = mean(n_mental_health),
-    avg_diagnostic_lab = mean(n_diagnostic_lab),
+    across(
+      c(n_eandem, n_pt, n_laboratory, n_mental_health, 
+        n_speech_therapy, n_immunization, n_preventive),
+      list(
+        avg = ~mean(.),
+        sd = ~sd(.)
+      ),
+      .names = "avg_{.col}_{.fn}"
+    ),
+    
     # Total costs
     avg_total_paid = mean(total_paid),
+    sd_total_paid = sd(total_paid),
     avg_total_oop = mean(total_oop),
+    sd_total_oop = sd(total_oop),
+    
     # Visit-type specific costs
-    avg_primary_care_paid = mean(primary_care_paid),
-    avg_primary_care_oop = mean(primary_care_oop),
-    avg_phys_therapy_paid = mean(phys_therapy_paid),
-    avg_phys_therapy_oop = mean(phys_therapy_oop),
-    avg_mental_health_paid = mean(mental_health_paid),
-    avg_mental_health_oop = mean(mental_health_oop),
-    avg_diagnostic_lab_paid = mean(diagnostic_lab_paid),
-    avg_diagnostic_lab_oop = mean(diagnostic_lab_oop)
-  )
+    across(
+      ends_with("_paid"),
+      list(
+        avg = ~mean(., na.rm = TRUE)
+      ),
+      .names = "avg_{.col}"
+    ),
+    
+    across(
+      ends_with("_oop"),
+      list(
+        avg = ~mean(., na.rm = TRUE)
+      ),
+      .names = "avg_{.col}"
+    ),
+    .groups = 'drop'
+  ) %>%
+  arrange(Treat_Control_Cohort, post_period)
 
+# Print results
 print("Average Yearly Utilization and Costs per Member:")
-print(summary_stats)
+print(summary_stats, n = Inf)
 
 ## D. Outliers----
-### Inital identification----
-# Summary statistics and boxplot data for each visit type
+### Initial identification----
+# Summary statistics for each visit type
 utilization_stats <- yearly_utilization %>%
-  group_by(Treat_Control_Cohort, post_period) %>%
+  group_by(post_period) %>%
   summarise(
-    # Primary Care
-    min_primary = min(n_primary_care),
-    q1_primary = quantile(n_primary_care, 0.25),
-    median_primary = median(n_primary_care),
-    mean_primary = mean(n_primary_care),
-    q3_primary = quantile(n_primary_care, 0.75),
-    max_primary = max(n_primary_care),
-    
-    # Physical Therapy
-    min_phys = min(n_physical_therapy),
-    q1_phys = quantile(n_physical_therapy, 0.25),
-    median_phys = median(n_physical_therapy),
-    mean_phys = mean(n_physical_therapy),
-    q3_phys = quantile(n_physical_therapy, 0.75),
-    max_phys = max(n_physical_therapy),
-    
-    # Mental Health
-    min_mental = min(n_mental_health),
-    q1_mental = quantile(n_mental_health, 0.25),
-    median_mental = median(n_mental_health),
-    mean_mental = mean(n_mental_health),
-    q3_mental = quantile(n_mental_health, 0.75),
-    max_mental = max(n_mental_health),
-    
-    # Diagnostic Lab
-    min_lab = min(n_diagnostic_lab),
-    q1_lab = quantile(n_diagnostic_lab, 0.25),
-    median_lab = median(n_diagnostic_lab),
-    mean_lab = mean(n_diagnostic_lab),
-    q3_lab = quantile(n_diagnostic_lab, 0.75),
-    max_lab = max(n_diagnostic_lab)
+    across(
+      c(n_eandem, n_pt, n_laboratory, n_mental_health, 
+        n_speech_therapy, n_immunization, n_preventive),
+      list(
+        min = ~min(.),
+        q1 = ~quantile(., 0.25),
+        median = ~median(.),
+        mean = ~mean(.),
+        q3 = ~quantile(., 0.75),
+        max = ~max(.)
+      ),
+      .names = "{.col}_{.fn}"
+    )
   )
 
 # Calculate outlier thresholds (1.5 * IQR method)
 outlier_thresholds <- yearly_utilization %>%
-  group_by(Treat_Control_Cohort, post_period) %>%
+  group_by(post_period) %>%
   summarise(
-    # Primary Care
-    iqr_primary = IQR(n_primary_care),
-    upper_threshold_primary = quantile(n_primary_care, 0.75) + 1.5 * IQR(n_primary_care),
-    n_outliers_primary = sum(n_primary_care > (quantile(n_primary_care, 0.75) + 1.5 * IQR(n_primary_care))),
-    
-    # Physical Therapy
-    iqr_phys = IQR(n_physical_therapy),
-    upper_threshold_phys = quantile(n_physical_therapy, 0.75) + 1.5 * IQR(n_physical_therapy),
-    n_outliers_phys = sum(n_physical_therapy > (quantile(n_physical_therapy, 0.75) + 1.5 * IQR(n_physical_therapy))),
-    
-    # Mental Health
-    iqr_mental = IQR(n_mental_health),
-    upper_threshold_mental = quantile(n_mental_health, 0.75) + 1.5 * IQR(n_mental_health),
-    n_outliers_mental = sum(n_mental_health > (quantile(n_mental_health, 0.75) + 1.5 * IQR(n_mental_health))),
-    
-    # Diagnostic Lab
-    iqr_lab = IQR(n_diagnostic_lab),
-    upper_threshold_lab = quantile(n_diagnostic_lab, 0.75) + 1.5 * IQR(n_diagnostic_lab),
-    n_outliers_lab = sum(n_diagnostic_lab > (quantile(n_diagnostic_lab, 0.75) + 1.5 * IQR(n_diagnostic_lab)))
+    across(
+      c(n_eandem, n_pt, n_laboratory, n_mental_health, 
+        n_speech_therapy, n_immunization, n_preventive),
+      list(
+        iqr = ~IQR(.),
+        upper_threshold = ~quantile(., 0.75) + 1.5 * IQR(.),
+        n_outliers = ~sum(. > (quantile(., 0.75) + 1.5 * IQR(.)))
+      ),
+      .names = "{.col}_{.fn}"
+    )
   )
 
 print("Distribution Statistics:")
@@ -2250,179 +2372,209 @@ print(utilization_stats)
 print("\nOutlier Analysis:")
 print(outlier_thresholds)
 
-# Identify extreme outliers (if any)
+# Identify extreme outliers (> 3 IQR)
 extreme_outliers <- yearly_utilization %>%
-  group_by(Treat_Control_Cohort, post_period) %>%
+  group_by(post_period) %>%
   filter(
-    n_primary_care > quantile(n_primary_care, 0.75) + 3 * IQR(n_primary_care) |
-      n_physical_therapy > quantile(n_physical_therapy, 0.75) + 3 * IQR(n_physical_therapy) |
+    n_eandem > quantile(n_eandem, 0.75) + 3 * IQR(n_eandem) |
+      n_pt > quantile(n_pt, 0.75) + 3 * IQR(n_pt) |
+      n_laboratory > quantile(n_laboratory, 0.75) + 3 * IQR(n_laboratory) |
       n_mental_health > quantile(n_mental_health, 0.75) + 3 * IQR(n_mental_health) |
-      n_diagnostic_lab > quantile(n_diagnostic_lab, 0.75) + 3 * IQR(n_diagnostic_lab)
+      n_speech_therapy > quantile(n_speech_therapy, 0.75) + 3 * IQR(n_speech_therapy) |
+      n_immunization > quantile(n_immunization, 0.75) + 3 * IQR(n_immunization) |
+      n_preventive > quantile(n_preventive, 0.75) + 3 * IQR(n_preventive)
   ) %>%
   select(
     MVDID, Treat_Control_Cohort, post_period,
-    n_primary_care, n_physical_therapy, n_mental_health, n_diagnostic_lab
+    n_eandem, n_pt, n_laboratory, n_mental_health, 
+    n_speech_therapy, n_immunization, n_preventive
   )
 
 print("\nExtreme Outliers (> 3 IQR):")
 print(extreme_outliers)
 
 ### a. Examine Percentile Distributions ----
-# Calculate 95th and 99th percentiles for each visit type
+# Calculate 95th and 99th percentiles
 percentile_dist <- yearly_utilization %>%
-  group_by(Treat_Control_Cohort, post_period) %>%
+  group_by(post_period) %>%
   summarise(
-    # Primary Care
-    p95_primary = quantile(n_primary_care, 0.95),
-    p99_primary = quantile(n_primary_care, 0.99),
-    
-    # Physical Therapy
-    p95_phys = quantile(n_physical_therapy, 0.95),
-    p99_phys = quantile(n_physical_therapy, 0.99),
-    
-    # Mental Health
-    p95_mental = quantile(n_mental_health, 0.95),
-    p99_mental = quantile(n_mental_health, 0.99),
-    
-    # Diagnostic Lab
-    p95_lab = quantile(n_diagnostic_lab, 0.95),
-    p99_lab = quantile(n_diagnostic_lab, 0.99)
+    across(
+      c(n_eandem, n_pt, n_laboratory, n_mental_health, 
+        n_speech_therapy, n_immunization, n_preventive),
+      list(
+        p95 = ~quantile(., 0.95),
+        p99 = ~quantile(., 0.99)
+      ),
+      .names = "{.col}_{.fn}"
+    )
   )
 
 ### b. Compare with Current Distribution ----
 distribution_summary <- yearly_utilization %>%
-  group_by(Treat_Control_Cohort, post_period) %>%
+  group_by(post_period) %>%
   summarise(
-    # Primary Care
-    mean_primary = mean(n_primary_care),
-    median_primary = median(n_primary_care),
-    max_primary = max(n_primary_care),
-    
-    # Physical Therapy
-    mean_phys = mean(n_physical_therapy),
-    median_phys = median(n_physical_therapy),
-    max_phys = max(n_physical_therapy),
-    
-    # Mental Health
-    mean_mental = mean(n_mental_health),
-    median_mental = median(n_mental_health),
-    max_mental = max(n_mental_health),
-    
-    # Diagnostic Lab
-    mean_lab = mean(n_diagnostic_lab),
-    median_lab = median(n_diagnostic_lab),
-    max_lab = max(n_diagnostic_lab)
+    across(
+      c(n_eandem, n_pt, n_laboratory, n_mental_health, 
+        n_speech_therapy, n_immunization, n_preventive),
+      list(
+        mean = ~mean(.),
+        median = ~median(.),
+        max = ~max(.)
+      ),
+      .names = "{.col}_{.fn}"
+    )
   )
 
 ### c. Count Cases Above Thresholds ----
 cases_above_threshold <- yearly_utilization %>%
-  group_by(Treat_Control_Cohort, post_period) %>%
+  group_by(post_period) %>%
   summarise(
-    # Primary Care
-    n_above_95_primary = sum(n_primary_care > quantile(n_primary_care, 0.95)),
-    n_above_99_primary = sum(n_primary_care > quantile(n_primary_care, 0.99)),
-    
-    # Physical Therapy
-    n_above_95_phys = sum(n_physical_therapy > quantile(n_physical_therapy, 0.95)),
-    n_above_99_phys = sum(n_physical_therapy > quantile(n_physical_therapy, 0.99)),
-    
-    # Mental Health
-    n_above_95_mental = sum(n_mental_health > quantile(n_mental_health, 0.95)),
-    n_above_99_mental = sum(n_mental_health > quantile(n_mental_health, 0.99)),
-    
-    # Diagnostic Lab
-    n_above_95_lab = sum(n_diagnostic_lab > quantile(n_diagnostic_lab, 0.95)),
-    n_above_99_lab = sum(n_diagnostic_lab > quantile(n_diagnostic_lab, 0.99))
+    across(
+      c(n_eandem, n_pt, n_laboratory, n_mental_health, 
+        n_speech_therapy, n_immunization, n_preventive),
+      list(
+        n_above_95 = ~sum(. > quantile(., 0.95)),
+        n_above_99 = ~sum(. > quantile(., 0.99))
+      ),
+      .names = "{.col}_{.fn}"
+    )
   )
 
 print("95th and 99th Percentile Thresholds:")
 print(percentile_dist)
-
 print("\nCurrent Distribution Summary:")
 print(distribution_summary)
-
 print("\nNumber of Cases Above Thresholds:")
 print(cases_above_threshold)
 
 ### d. Winsorize at 99th Percentile ----
-# Create winsorized version of yearly utilization
-yearly_utilization_winsorized <- yearly_utilization %>%
-  group_by(Treat_Control_Cohort, post_period) %>%
-  mutate(
-    # Winsorize primary care visits
-    n_primary_care_w = pmin(n_primary_care, 
-                            quantile(n_primary_care, 0.99)),
-    
-    # Winsorize physical therapy visits
-    n_physical_therapy_w = pmin(n_physical_therapy, 
-                                quantile(n_physical_therapy, 0.99)),
-    
-    # Winsorize mental health visits
-    n_mental_health_w = pmin(n_mental_health, 
-                             quantile(n_mental_health, 0.99)),
-    
-    # Winsorize diagnostic lab visits
-    n_diagnostic_lab_w = pmin(n_diagnostic_lab, 
-                              quantile(n_diagnostic_lab, 0.99))
-  ) %>%
-  ungroup()
+# Calculate overall 99th percentile thresholds
+thresholds <- yearly_utilization %>%
+  summarise(
+    across(
+      c(n_eandem, n_pt, n_laboratory, n_mental_health, 
+        n_speech_therapy, n_immunization, n_preventive),
+      ~as.integer(quantile(., 0.99)),
+      .names = "{.col}_99"
+    )
+  )
 
-#### d.1.. Verify Winsorization ----
-# Compare original vs winsorized distributions
+print("Overall 99th percentile thresholds:")
+print(thresholds)
+
+# Create winsorized version
+yearly_utilization_winsorized <- yearly_utilization %>%
+  mutate(
+    n_eandem_w = as.integer(pmin(n_eandem, thresholds$n_eandem_99)),
+    n_pt_w = as.integer(pmin(n_pt, thresholds$n_pt_99)),
+    n_laboratory_w = as.integer(pmin(n_laboratory, thresholds$n_laboratory_99)),
+    n_mental_health_w = as.integer(pmin(n_mental_health, thresholds$n_mental_health_99)),
+    n_speech_therapy_w = as.integer(pmin(n_speech_therapy, thresholds$n_speech_therapy_99)),
+    n_immunization_w = as.integer(pmin(n_immunization, thresholds$n_immunization_99)),
+    n_preventive_w = as.integer(pmin(n_preventive, thresholds$n_preventive_99))
+  )
+
+# Verify winsorization
 winsorized_summary <- yearly_utilization_winsorized %>%
   group_by(Treat_Control_Cohort, post_period) %>%
   summarise(
-    # Original means
-    mean_primary_orig = mean(n_primary_care),
-    mean_phys_orig = mean(n_physical_therapy),
-    mean_mental_orig = mean(n_mental_health),
-    mean_lab_orig = mean(n_diagnostic_lab),
-    
-    # Winsorized means
-    mean_primary_w = mean(n_primary_care_w),
-    mean_phys_w = mean(n_physical_therapy_w),
-    mean_mental_w = mean(n_mental_health_w),
-    mean_lab_w = mean(n_diagnostic_lab_w),
-    
-    # Original max values
-    max_primary_orig = max(n_primary_care),
-    max_phys_orig = max(n_physical_therapy),
-    max_mental_orig = max(n_mental_health),
-    max_lab_orig = max(n_diagnostic_lab),
-    
-    # Winsorized max values
-    max_primary_w = max(n_primary_care_w),
-    max_phys_w = max(n_physical_therapy_w),
-    max_mental_w = max(n_mental_health_w),
-    max_lab_w = max(n_diagnostic_lab_w)
+    across(
+      c(n_eandem, n_pt, n_laboratory, n_mental_health, 
+        n_speech_therapy, n_immunization, n_preventive),
+      list(
+        mean_orig = ~mean(.),
+        max_orig = ~max(.)
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    across(
+      c(n_eandem_w, n_pt_w, n_laboratory_w, n_mental_health_w, 
+        n_speech_therapy_w, n_immunization_w, n_preventive_w),
+      list(
+        mean_w = ~mean(.),
+        max_w = ~as.integer(max(.))
+      ),
+      .names = "{.col}_{.fn}"
+    )
   )
 
-print("Summary of Original vs Winsorized Distributions:")
-print(winsorized_summary)
+print("\nSummary of Original vs Winsorized Distributions:")
+print(winsorized_summary, width = Inf)
+
 
 ### e. Create Final Analytical Dataset ----
 # Keep winsorized versions for analysis
 final_analytical_dataset_w <- yearly_utilization_winsorized %>%
   select(
+    # Member identifiers
+    MVDID, SUBSCRIBERID,
+    
     # Keep all original variables
     Treat_Control_Cohort, post_period, Plan_year,
-    age_group, family_size_bins, comorbid_bins, PATIENTGENDER,
+    age_group, age_at_plan_year_start, family_size_bins, tot_comorbidities,
+    comorbid_bins, PATIENTGENDER, deductible_level,
     DEDUCTIBLE_CATEGORY, HSA_Flag_final,
-    PCP_copay, Specialist_copay, ED_copay,
+    PCP_copay, Specialist_copay, ED_copay, 
     
     # Include both original and winsorized utilization measures
-    n_primary_care, n_primary_care_w,
-    n_physical_therapy, n_physical_therapy_w,
+    n_eandem, n_eandem_w,
+    n_pt, n_pt_w,
+    n_laboratory, n_laboratory_w,
     n_mental_health, n_mental_health_w,
-    n_diagnostic_lab, n_diagnostic_lab_w,
+    n_speech_therapy, n_speech_therapy_w,
+    n_immunization, n_immunization_w,
+    n_preventive, n_preventive_w,
     
     # Keep cost variables
     total_paid, total_oop,
-    primary_care_paid, primary_care_oop,
-    phys_therapy_paid, phys_therapy_oop,
+    eandem_paid, eandem_oop,
+    pt_paid, pt_oop,
+    laboratory_paid, laboratory_oop,
     mental_health_paid, mental_health_oop,
-    diagnostic_lab_paid, diagnostic_lab_oop
+    speech_therapy_paid, speech_therapy_oop,
+    immunization_paid, immunization_oop,
+    preventive_paid, preventive_oop
   )
+
+# Convert variables to appropriate types
+final_analytical_dataset_w <- final_analytical_dataset_w %>%
+  mutate(
+    # Convert to factors
+    PATIENTGENDER = as.factor(PATIENTGENDER),
+    deductible_level = as.factor(deductible_level),
+    DEDUCTIBLE_CATEGORY = as.factor(DEDUCTIBLE_CATEGORY),
+    HSA_Flag_final = as.factor(HSA_Flag_final),
+    Treat_Control_Cohort = as.factor(Treat_Control_Cohort),
+    post_period = as.factor(post_period),
+    Plan_year = as.factor(Plan_year),
+    age_group = as.factor(age_group),
+    family_size_bins = as.factor(family_size_bins),
+    comorbid_bins = as.factor(comorbid_bins)
+  )
+
+# Verify the structure of the final dataset
+str(final_analytical_dataset_w)
+
+# Summary statistics of the final dataset
+summary_stats_final <- final_analytical_dataset_w %>%
+  group_by(Treat_Control_Cohort, post_period) %>%
+  summarise(
+    n_members = n(),
+    
+    # Utilization measures (both original and winsorized)
+    across(
+      c(starts_with("n_"), ends_with("_paid"), ends_with("_oop")),
+      list(
+        mean = ~mean(., na.rm = TRUE),
+        sd = ~sd(., na.rm = TRUE)
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = 'drop'
+  )
+
+print("Final Dataset Summary Statistics:")
+print(summary_stats_final, width = Inf)
 
 # 4. DiD Analysis---- 
 library(MASS)
@@ -2438,10 +2590,11 @@ start.time <- Sys.time()
 run_nb_model <- function(dependent_var, data) {
   formula <- as.formula(paste(
     dependent_var, "~ Treat_Control_Cohort*post_period + 
+    Treat_Control_Cohort + post_period +
     age_group + family_size_bins + comorbid_bins + 
-    PATIENTGENDER + DEDUCTIBLE_CATEGORY + 
-    PCP_copay + Specialist_copay + ED_copay + 
-    HSA_Flag_final + factor(Plan_year)"
+    PATIENTGENDER + deductible_level + 
+    PCP_copay + Specialist_copay + ED_copay +
+    HSA_Flag_final + Plan_year"
   ))
   
   model <- glm.nb(formula, data = data)
@@ -2450,10 +2603,13 @@ run_nb_model <- function(dependent_var, data) {
 
 # Run models with winsorized variables
 models_w <- list(
-  pcp = run_nb_model("n_primary_care_w", final_analytical_dataset_w),
-  pt = run_nb_model("n_physical_therapy_w", final_analytical_dataset_w),
+  eandem = run_nb_model("n_eandem_w", final_analytical_dataset_w),
+  pt = run_nb_model("n_pt_w", final_analytical_dataset_w),
+  lab = run_nb_model("n_laboratory_w", final_analytical_dataset_w),
   mh = run_nb_model("n_mental_health_w", final_analytical_dataset_w),
-  lab = run_nb_model("n_diagnostic_lab_w", final_analytical_dataset_w)
+  st = run_nb_model("n_speech_therapy_w", final_analytical_dataset_w),
+  imm = run_nb_model("n_immunization_w", final_analytical_dataset_w),
+  prev = run_nb_model("n_preventive_w", final_analytical_dataset_w)
 )
 
 # Print summaries
@@ -2468,62 +2624,96 @@ run_clustered_se <- function(model, cluster_var) {
   coeftest(model, vcov. = vcovCL(model, cluster = cluster_var, type = "HC0"))
 }
 
-# Calculate clustered SEs
+# Calculate clustered SEs at family level
 clustered_results_w <- lapply(models_w, function(model) {
-  run_clustered_se(model, final_analytical_dataset_w$MVDID)
+  run_clustered_se(model, final_analytical_dataset_w$SUBSCRIBERID)
 })
 
-## C. Margins ----
-# Function to calculate margins
-calculate_margins <- function(model) {
-  margins <- margins(model)
-  summary(margins)
+# Print results for each model
+service_types <- c("E&M Services", "Physical Therapy", "Laboratory Services", 
+                   "Mental Health", "Speech Therapy", "Immunization", "Preventive Services")
+
+for(i in seq_along(clustered_results_w)) {
+  cat("\n", service_types[i], "Results with Family-Level Clustering:\n")
+  print(clustered_results_w[[i]])
 }
 
-# Calculate margins for all models
+## C. Margins ----
+library(margins)
+
+## C. Margins ----
+library(ggeffects)  # Loading the correct package name
+
+# Function to calculate predicted margins
+calculate_margins <- function(model) {
+  # Get predicted margins for treatment*period interaction
+  margins <- ggpredict(model, terms = c("Treat_Control_Cohort", "post_period"))
+  return(margins)
+}
+
+# Calculate predicted margins for all models
 margins_results_w <- lapply(models_w, calculate_margins)
 
-### c1. Store Results ----
-model_results_w <- list(
-  models = models_w,
-  clustered_se = clustered_results_w,
-  margins = margins_results_w
-)
-
-end.time <- Sys.time()
-time.taken <- end.time - start.time
-
-print(paste("Time taken for analysis:", time.taken))
-
-### c2. Extract Key Results ----
-# Function to extract key coefficients and standard errors
-extract_key_results <- function(model, clustered_se) {
-  interaction_term <- coef(model)["Treat_Control_Cohort:post_period"]
-  clustered_se_value <- clustered_se["Treat_Control_Cohort:post_period", "Std. Error"]
-  p_value <- clustered_se["Treat_Control_Cohort:post_period", "Pr(>|z|)"]
+# Function to calculate DiD effect from margins
+calculate_did <- function(margins) {
+  # Extract predictions
+  preds <- margins$predicted
   
-  return(c(
-    estimate = interaction_term,
-    std_error = clustered_se_value,
+  # Calculate DiD
+  did <- (preds[4] - preds[3]) - (preds[2] - preds[1])
+  
+  # Calculate standard errors for difference
+  se <- sqrt(margins$std.error[4]^2 + margins$std.error[3]^2 + 
+               margins$std.error[2]^2 + margins$std.error[1]^2)
+  
+  # Calculate z-statistic and p-value
+  z_stat <- did/se
+  p_value <- 2 * (1 - pnorm(abs(z_stat)))
+  
+  return(list(
+    predictions = data.frame(
+      Treat_Control_Cohort = margins$x,
+      post_period = margins$group,
+      predicted = margins$predicted,
+      std.error = margins$std.error,
+      conf.low = margins$conf.low,
+      conf.high = margins$conf.high
+    ),
+    did_effect = did,
+    std.error = se,
+    z_statistic = z_stat,
     p_value = p_value
   ))
 }
 
-# Extract results for each model
-key_results_w <- lapply(names(models_w), function(model_name) {
-  extract_key_results(
-    models_w[[model_name]], 
-    clustered_results_w[[model_name]]
-  )
-})
-names(key_results_w) <- names(models_w)
+# Calculate DiD effects
+did_results_w <- lapply(margins_results_w, calculate_did)
 
-# Create summary table
-results_summary_w <- do.call(rbind, key_results_w)
-rownames(results_summary_w) <- c("Primary Care", "Physical Therapy", "Mental Health", "Diagnostic Lab")
-print("\nKey DiD Results (Winsorized):")
-print(results_summary_w)
+# Print results
+service_types <- c("E&M Services", "Physical Therapy", "Laboratory Services", 
+                   "Mental Health", "Speech Therapy", "Immunization", "Preventive Services")
 
+for(i in seq_along(did_results_w)) {
+  cat("\nResults for", service_types[i], ":\n")
+  cat("\nPredicted Values:\n")
+  print(did_results_w[[i]]$predictions)
+  cat("\nDifference-in-Differences Effect:", round(did_results_w[[i]]$did_effect, 4))
+  cat("\nStandard Error:", round(did_results_w[[i]]$std.error, 4))
+  cat("\nZ-statistic:", round(did_results_w[[i]]$z_statistic, 4))
+  cat("\nP-value:", round(did_results_w[[i]]$p_value, 4), "\n")
+}
+
+# Optional: Create a summary table of DiD effects
+did_summary <- data.frame(
+  Service = service_types,
+  DiD_Effect = sapply(did_results_w, function(x) x$did_effect),
+  Std_Error = sapply(did_results_w, function(x) x$std.error),
+  Z_Statistic = sapply(did_results_w, function(x) x$z_statistic),
+  P_Value = sapply(did_results_w, function(x) x$p_value)
+)
+
+print("\nSummary of Difference-in-Differences Effects:")
+print(did_summary)
 
 ## B. Hurdle Model----
 # Hurdle Model Section
