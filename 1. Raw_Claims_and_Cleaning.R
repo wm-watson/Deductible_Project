@@ -1301,8 +1301,8 @@ imputation_summary <- benefits_final_imputed %>%
 
 print(imputation_summary)
 
-saveRDS(benefits_final_imputed, "benefits_final_impured.rds")
-benefits_final_imputed <- readRDS(paste0(filepath, "benefits_final_impured.rds"))
+saveRDS(benefits_final_imputed, "benefits_final_imputed.rds")
+benefits_final_imputed <- readRDS(paste0(filepath, "benefits_final_imputed.rds"))
 
 #### 5. Treat Claims w/Benefits----
 # 1. Clean benefits data - take most common benefit structure per company/subgroup/year
@@ -2050,14 +2050,88 @@ combined_claims <- combined_claims %>%
     )
   )
 
+## A.a. Deduplication----
+# Step 1: Aggregate from claimline to claim level
+claim_level <- combined_claims %>%
+  group_by(MVDID, SERVICEFROMDATE, PROCEDURECODE, CLAIMNUMBER) %>%
+  summarise(
+    # Sum all payment/amount fields
+    total_billed = sum(BILLEDAMOUNT, na.rm = TRUE),
+    total_allowed = sum(ALLOWEDAMOUNT, na.rm = TRUE),
+    total_paid = sum(PAIDAMOUNT, na.rm = TRUE),
+    total_deductible = sum(DEDUCTIBLEAMOUNT, na.rm = TRUE),
+    total_copay = sum(COPAYAMOUNT, na.rm = TRUE),
+    total_coins = sum(COINSURANCEAMOUNT, na.rm = TRUE),
+    total_cob = sum(COBAMOUNT, na.rm = TRUE),
+    total_noncovered = sum(NONCOVEREDAMOUNT, na.rm = TRUE),
+    
+    # Keep first occurrence for ID/categorical variables
+    SUBSCRIBERID = first(SUBSCRIBERID),
+    COMPANY_KEY = first(COMPANY_KEY),
+    SUBGROUPKEY = first(SUBGROUPKEY),
+    MEMBERID = first(MEMBERID),
+    ZIPCODE = first(ZIPCODE),
+    PARTYKEY = first(PARTYKEY),
+    PLACEOFSERVICE = first(PLACEOFSERVICE),
+    MOD1 = first(MOD1),
+    REVENUECODE = first(REVENUECODE),
+    MEMBERKEY = first(MEMBERKEY),
+    PLANGROUP = first(PLANGROUP),
+    LOB = first(LOB),
+    
+    # Concatenate unique diagnosis codes
+    CODEVALUE = paste(unique(CODEVALUE), collapse = "; "),
+    CODETYPE = paste(unique(CODETYPE), collapse = "; "),
+    
+    # Keep first occurrence for demographic/plan variables
+    PATIENTDOB = first(PATIENTDOB),
+    PATIENTGENDER = first(PATIENTGENDER),
+    NETWORKINDICATOR = first(NETWORKINDICATOR),
+    Plan_year = first(Plan_year),
+    plan_year_start = first(plan_year_start),
+    age_at_plan_year_start = first(age_at_plan_year_start),
+    family_size = first(family_size),
+    DEDUCTIBLE_CATEGORY = first(DEDUCTIBLE_CATEGORY),
+    tot_comorbidities = first(tot_comorbidities),
+    comorbid_bins = first(comorbid_bins),
+    age_group = first(age_group),
+    family_size_bins = first(family_size_bins),
+    DEDUCTIBLE_final = first(DEDUCTIBLE_final),
+    PCP_copay = first(PCP_copay),
+    Specialist_copay = first(Specialist_copay),
+    ED_copay = first(ED_copay),
+    HSA_Flag_final = first(HSA_Flag_final),
+    Treat_Control_Cohort = first(Treat_Control_Cohort),
+    post_period = first(post_period),
+    deductible_level = first(deductible_level),
+    procedure_category = first(procedure_category),
+    proc_description = first(proc_description),
+    
+    # Add count of claim lines
+    claim_lines = n(),
+    .groups = 'drop'
+  )
+
+# Step 2: Handle duplicate claims (keep latest version)
+clean_encounters <- claim_level %>%
+  group_by(MVDID, SERVICEFROMDATE, PROCEDURECODE) %>%
+  slice_max(CLAIMNUMBER, n = 1) %>%
+  ungroup()
+
+# Verification
+print("Variable count check:")
+print(paste("Original variables:", ncol(combined_claims)))
+print(paste("Cleaned variables:", ncol(clean_encounters)))
+beep(8)
+
 # STEP 2: ANALYZE FREQUENCIES BY GROUP AND PERIOD
 # Analyze frequencies by group and period
-utilization_freq <- combined_claims %>%
+utilization_freq <- clean_encounters %>%
   group_by(Treat_Control_Cohort, post_period, procedure_category, proc_description) %>%
   summarise(
     n_claims = n(),
     n_members = n_distinct(MVDID),
-    total_paid = sum(PAIDAMOUNT, na.rm = TRUE),
+    total_paid = sum(total_paid, na.rm = TRUE),  # Changed from PAIDAMOUNT to total_paid
     .groups = 'drop'
   ) %>%
   group_by(Treat_Control_Cohort, post_period) %>%
@@ -2120,9 +2194,9 @@ print(utilization_freq %>%
 
 
 ## B. Analytical Dataset----
-final_analytical_dataset <- combined_claims %>%
+final_analytical_dataset <- clean_encounters %>%
   mutate(
-    # Outcome Variables (Visit Types)
+    # Outcome Variables (Visit Types) - these stay the same
     is_eandem = case_when(
       procedure_category == "E_and_M" ~ 1,
       TRUE ~ 0
@@ -2153,12 +2227,12 @@ final_analytical_dataset <- combined_claims %>%
     )
   ) %>%
   select(
-    # Keep all your existing selection variables, plus new outcome variables
+    # Updated variable names for amounts
     MVDID, SUBSCRIBERID, age_group, family_size_bins, comorbid_bins,             
     PATIENTGENDER, age_at_plan_year_start, tot_comorbidities,
     DEDUCTIBLE_CATEGORY, PCP_copay, Specialist_copay, ED_copay,
-    DEDUCTIBLE_final, BILLEDAMOUNT, ALLOWEDAMOUNT, PAIDAMOUNT,
-    COINSURANCEAMOUNT, COPAYAMOUNT, DEDUCTIBLEAMOUNT, Plan_year,
+    DEDUCTIBLE_final, total_billed, total_allowed, total_paid,
+    total_coins, total_copay, total_deductible, Plan_year,
     HSA_Flag_final, Treat_Control_Cohort, post_period, deductible_level,
     
     # New outcome variables
@@ -2183,27 +2257,27 @@ yearly_utilization <- final_analytical_dataset %>%
     n_immunization = sum(is_immunization),
     n_preventive = sum(is_preventive),
     
-    # Costs by new categories
-    eandem_paid = sum(PAIDAMOUNT * (is_eandem == 1), na.rm = TRUE),
-    eandem_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_eandem == 1), na.rm = TRUE),
+    # Updated cost calculations with new variable names
+    eandem_paid = sum(total_paid * (is_eandem == 1), na.rm = TRUE),
+    eandem_oop = sum((total_coins + total_copay + total_deductible) * (is_eandem == 1), na.rm = TRUE),
     
-    pt_paid = sum(PAIDAMOUNT * (is_pt == 1), na.rm = TRUE),
-    pt_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_pt == 1), na.rm = TRUE),
+    pt_paid = sum(total_paid * (is_pt == 1), na.rm = TRUE),
+    pt_oop = sum((total_coins + total_copay + total_deductible) * (is_pt == 1), na.rm = TRUE),
     
-    laboratory_paid = sum(PAIDAMOUNT * (is_laboratory == 1), na.rm = TRUE),
-    laboratory_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_laboratory == 1), na.rm = TRUE),
+    laboratory_paid = sum(total_paid * (is_laboratory == 1), na.rm = TRUE),
+    laboratory_oop = sum((total_coins + total_copay + total_deductible) * (is_laboratory == 1), na.rm = TRUE),
     
-    mental_health_paid = sum(PAIDAMOUNT * (is_mental_health == 1), na.rm = TRUE),
-    mental_health_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_mental_health == 1), na.rm = TRUE),
+    mental_health_paid = sum(total_paid * (is_mental_health == 1), na.rm = TRUE),
+    mental_health_oop = sum((total_coins + total_copay + total_deductible) * (is_mental_health == 1), na.rm = TRUE),
     
-    speech_therapy_paid = sum(PAIDAMOUNT * (is_speech_therapy == 1), na.rm = TRUE),
-    speech_therapy_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_speech_therapy == 1), na.rm = TRUE),
+    speech_therapy_paid = sum(total_paid * (is_speech_therapy == 1), na.rm = TRUE),
+    speech_therapy_oop = sum((total_coins + total_copay + total_deductible) * (is_speech_therapy == 1), na.rm = TRUE),
     
-    immunization_paid = sum(PAIDAMOUNT * (is_immunization == 1), na.rm = TRUE),
-    immunization_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_immunization == 1), na.rm = TRUE),
+    immunization_paid = sum(total_paid * (is_immunization == 1), na.rm = TRUE),
+    immunization_oop = sum((total_coins + total_copay + total_deductible) * (is_immunization == 1), na.rm = TRUE),
     
-    preventive_paid = sum(PAIDAMOUNT * (is_preventive == 1), na.rm = TRUE),
-    preventive_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_preventive == 1), na.rm = TRUE),
+    preventive_paid = sum(total_paid * (is_preventive == 1), na.rm = TRUE),
+    preventive_oop = sum((total_coins + total_copay + total_deductible) * (is_preventive == 1), na.rm = TRUE),
     
     # Keep all member characteristics
     SUBSCRIBERID = first(SUBSCRIBERID),
@@ -2240,33 +2314,33 @@ yearly_utilization <- final_analytical_dataset %>%
     n_immunization = sum(is_immunization),
     n_preventive = sum(is_preventive),
     
-    # Total yearly costs
-    total_paid = sum(PAIDAMOUNT, na.rm = TRUE),
-    total_oop = sum(COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT, na.rm = TRUE),
+    # Total yearly costs - updated variable names
+    total_paid = sum(total_paid, na.rm = TRUE),
+    total_oop = sum(total_coins + total_copay + total_deductible, na.rm = TRUE),
     
-    # Visit-type specific costs
-    eandem_paid = sum(PAIDAMOUNT * (is_eandem == 1), na.rm = TRUE),
-    eandem_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_eandem == 1), na.rm = TRUE),
+    # Visit-type specific costs - updated variable names
+    eandem_paid = sum(total_paid * (is_eandem == 1), na.rm = TRUE),
+    eandem_oop = sum((total_coins + total_copay + total_deductible) * (is_eandem == 1), na.rm = TRUE),
     
-    pt_paid = sum(PAIDAMOUNT * (is_pt == 1), na.rm = TRUE),
-    pt_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_pt == 1), na.rm = TRUE),
+    pt_paid = sum(total_paid * (is_pt == 1), na.rm = TRUE),
+    pt_oop = sum((total_coins + total_copay + total_deductible) * (is_pt == 1), na.rm = TRUE),
     
-    laboratory_paid = sum(PAIDAMOUNT * (is_laboratory == 1), na.rm = TRUE),
-    laboratory_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_laboratory == 1), na.rm = TRUE),
+    laboratory_paid = sum(total_paid * (is_laboratory == 1), na.rm = TRUE),
+    laboratory_oop = sum((total_coins + total_copay + total_deductible) * (is_laboratory == 1), na.rm = TRUE),
     
-    mental_health_paid = sum(PAIDAMOUNT * (is_mental_health == 1), na.rm = TRUE),
-    mental_health_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_mental_health == 1), na.rm = TRUE),
+    mental_health_paid = sum(total_paid * (is_mental_health == 1), na.rm = TRUE),
+    mental_health_oop = sum((total_coins + total_copay + total_deductible) * (is_mental_health == 1), na.rm = TRUE),
     
-    speech_therapy_paid = sum(PAIDAMOUNT * (is_speech_therapy == 1), na.rm = TRUE),
-    speech_therapy_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_speech_therapy == 1), na.rm = TRUE),
+    speech_therapy_paid = sum(total_paid * (is_speech_therapy == 1), na.rm = TRUE),
+    speech_therapy_oop = sum((total_coins + total_copay + total_deductible) * (is_speech_therapy == 1), na.rm = TRUE),
     
-    immunization_paid = sum(PAIDAMOUNT * (is_immunization == 1), na.rm = TRUE),
-    immunization_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_immunization == 1), na.rm = TRUE),
+    immunization_paid = sum(total_paid * (is_immunization == 1), na.rm = TRUE),
+    immunization_oop = sum((total_coins + total_copay + total_deductible) * (is_immunization == 1), na.rm = TRUE),
     
-    preventive_paid = sum(PAIDAMOUNT * (is_preventive == 1), na.rm = TRUE),
-    preventive_oop = sum((COINSURANCEAMOUNT + COPAYAMOUNT + DEDUCTIBLEAMOUNT) * (is_preventive == 1), na.rm = TRUE),
+    preventive_paid = sum(total_paid * (is_preventive == 1), na.rm = TRUE),
+    preventive_oop = sum((total_coins + total_copay + total_deductible) * (is_preventive == 1), na.rm = TRUE),
     
-    # Member characteristics
+    # Member characteristics (these stay the same)
     SUBSCRIBERID = first(SUBSCRIBERID),
     age_group = first(age_group),
     age_at_plan_year_start = first(age_at_plan_year_start),
