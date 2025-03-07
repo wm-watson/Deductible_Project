@@ -2714,45 +2714,76 @@ for(i in seq_along(clustered_results_w)) {
 
 ## C. Margins ----
 library(margins)
+library(ggeffects)
 
-## C. Margins ----
-library(ggeffects)  # Loading the correct package name
-
-# Function to calculate predicted margins
+# Function to calculate predicted margins and specific predictions
 calculate_margins <- function(model) {
-  # Get predicted margins for treatment*period interaction
-  margins <- ggpredict(model, terms = c("Treat_Control_Cohort", "post_period"))
-  return(margins)
+  # 1. Get average marginal effects for treatment*period interaction
+  avg_margins <- margins(model, 
+                         variables = c("Treat_Control_Cohort", "post_period"),
+                         interaction = TRUE)
+  
+  # 2. Get predicted margins across treatment and period
+  pred_margins <- ggpredict(model, terms = c("Treat_Control_Cohort", "post_period"))
+  
+  # 3. Get predictions at specific values (holding other variables at means/reference)
+  newdata <- expand.grid(
+    Treat_Control_Cohort = c(0, 1),
+    post_period = c(0, 1)
+  )
+  # Add mean/reference values for all other variables in the model
+  other_vars <- setdiff(names(model$model), c("Treat_Control_Cohort", "post_period"))
+  for(var in other_vars) {
+    if(is.factor(model$model[[var]])) {
+      newdata[[var]] <- factor(levels(model$model[[var]])[1], levels = levels(model$model[[var]]))
+    } else {
+      newdata[[var]] <- mean(model$model[[var]], na.rm = TRUE)
+    }
+  }
+  
+  specific_preds <- predict(model, newdata = newdata, se.fit = TRUE)
+  
+  return(list(
+    average_margins = avg_margins,
+    predicted_margins = pred_margins,
+    specific_predictions = data.frame(
+      newdata,
+      predicted = specific_preds$fit,
+      se = specific_preds$se.fit,
+      conf.low = specific_preds$fit - 1.96 * specific_preds$se.fit,
+      conf.high = specific_preds$fit + 1.96 * specific_preds$se.fit
+    )
+  ))
 }
 
-# Calculate predicted margins for all models
+# Calculate margins for all models
 margins_results_w <- lapply(models_w, calculate_margins)
 
-# Function to calculate DiD effect from margins
+# Function to calculate DiD effect
 calculate_did <- function(margins) {
-  # Extract predictions
-  preds <- margins$predicted
+  # Using specific predictions for DiD calculation
+  preds <- margins$specific_predictions
   
   # Calculate DiD
-  did <- (preds[4] - preds[3]) - (preds[2] - preds[1])
+  treated_diff <- with(preds[preds$Treat_Control_Cohort == 1,], 
+                       predicted[post_period == 1] - predicted[post_period == 0])
+  control_diff <- with(preds[preds$Treat_Control_Cohort == 0,], 
+                       predicted[post_period == 1] - predicted[post_period == 0])
+  did <- treated_diff - control_diff
   
-  # Calculate standard errors for difference
-  se <- sqrt(margins$std.error[4]^2 + margins$std.error[3]^2 + 
-               margins$std.error[2]^2 + margins$std.error[1]^2)
+  # Calculate standard error
+  se <- with(preds, sqrt(se[Treat_Control_Cohort == 1 & post_period == 1]^2 +
+                           se[Treat_Control_Cohort == 1 & post_period == 0]^2 +
+                           se[Treat_Control_Cohort == 0 & post_period == 1]^2 +
+                           se[Treat_Control_Cohort == 0 & post_period == 0]^2))
   
   # Calculate z-statistic and p-value
   z_stat <- did/se
   p_value <- 2 * (1 - pnorm(abs(z_stat)))
   
   return(list(
-    predictions = data.frame(
-      Treat_Control_Cohort = margins$x,
-      post_period = margins$group,
-      predicted = margins$predicted,
-      std.error = margins$std.error,
-      conf.low = margins$conf.low,
-      conf.high = margins$conf.high
-    ),
+    predictions = preds,
+    average_margins = margins$average_margins,
     did_effect = did,
     std.error = se,
     z_statistic = z_stat,
@@ -2769,15 +2800,20 @@ service_types <- c("E&M Services", "Physical Therapy", "Laboratory Services",
 
 for(i in seq_along(did_results_w)) {
   cat("\nResults for", service_types[i], ":\n")
-  cat("\nPredicted Values:\n")
+  
+  cat("\nAverage Marginal Effects:\n")
+  print(summary(did_results_w[[i]]$average_margins))
+  
+  cat("\nPredicted Values (holding other variables constant):\n")
   print(did_results_w[[i]]$predictions)
+  
   cat("\nDifference-in-Differences Effect:", round(did_results_w[[i]]$did_effect, 4))
   cat("\nStandard Error:", round(did_results_w[[i]]$std.error, 4))
   cat("\nZ-statistic:", round(did_results_w[[i]]$z_statistic, 4))
   cat("\nP-value:", round(did_results_w[[i]]$p_value, 4), "\n")
 }
 
-# Optional: Create a summary table of DiD effects
+# Create summary table
 did_summary <- data.frame(
   Service = service_types,
   DiD_Effect = sapply(did_results_w, function(x) x$did_effect),
