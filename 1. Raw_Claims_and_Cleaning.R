@@ -715,6 +715,7 @@ claims_elix_age_fam <- load(paste0(filepath, "claims_elix_age_fam.RData"))
 
 load("claims_elix_age_fam.RData")
 treat_claims <- claims_elix_age_fam
+rm(claims_elix_age_fam)
 
 #### 4. Benefit Information----
 ##### 4.a.1 Raw Data-----
@@ -1304,7 +1305,7 @@ print(imputation_summary)
 saveRDS(benefits_final_imputed, "benefits_final_imputed.rds")
 benefits_final_imputed <- readRDS(paste0(filepath, "benefits_final_imputed.rds"))
 
-#### 5. Treat Claims w/Benefits----
+##### 5. Treat Claims w/Benefits----
 # 1. Clean benefits data - take most common benefit structure per company/subgroup/year
 benefits_slim_unique <- benefits_final_imputed %>%
   group_by(COMPANYKEY, SUBGROUPKEY, Year) %>%
@@ -1531,7 +1532,7 @@ print("\nImputation Source Analysis:")
 print(source_analysis)
 
 
-### D. Control/Claims----
+## D. Control/Claims----
 #### 1. Elixhauser Comorbidities ----
 library(comorbidity)
 control_claims <- read_csv("control_claims.csv")
@@ -2650,6 +2651,8 @@ summary_stats_final <- final_analytical_dataset_w %>%
 print("Final Dataset Summary Statistics:")
 print(summary_stats_final, width = Inf)
 
+saveRDS(final_analytical_dataset_w, "final_analytical_dataset_w.rds")
+
 # 4. DiD Analysis---- 
 library(MASS)
 library(margins)
@@ -2657,37 +2660,674 @@ library(ggplot2)
 library(dplyr)
 library(gridExtra)
 
+
+options(scipen = 999)
 ## A. Negative Binomial Models ----
 start.time <- Sys.time()
 
-# Function to run negative binomial models
-run_nb_model <- function(dependent_var, data) {
+#function
+run_nb_model <- function(dependent_var, data, users_only = FALSE) {
+  # Get base variable name (remove _w suffix)
+  base_var <- sub("n_(.+)_w$", "\\1", dependent_var)
+  
+  # First ensure we have balanced panel - keep only members present in both periods
+  data <- data %>%
+    group_by(MVDID, Treat_Control_Cohort) %>%
+    filter(n_distinct(post_period) == 2) %>%  # Must be present in both periods
+    ungroup()
+  
+  if(users_only) {
+    # For users-only analysis, keep only those who had any utilization
+    data <- data %>%
+      group_by(MVDID) %>%
+      filter(sum(!!sym(dependent_var)) > 0) %>%
+      ungroup()
+  }
+  
+  # Print cohort sizes before modeling
+  cohort_summary <- data %>%
+    group_by(Treat_Control_Cohort, post_period) %>%
+    summarise(
+      n_unique_members = n_distinct(MVDID),
+      .groups = "drop"
+    )
+  
+  cat("\nCohort sizes for", base_var, ":\n")
+  print(cohort_summary)
+  
   formula <- as.formula(paste(
     dependent_var, "~ Treat_Control_Cohort*post_period + 
     Treat_Control_Cohort + post_period +
     age_group + family_size_bins + comorbid_bins + 
     PATIENTGENDER + deductible_level + 
-    PCP_copay + Specialist_copay + ED_copay +
+    PCP_copay + 
     HSA_Flag_final + Plan_year"
   ))
   
-  model <- glm.nb(formula, data = data)
-  return(model)
+  # Try to fit the model with increased iterations
+  tryCatch({
+    model <- glm.nb(formula, data = data, control = glm.control(maxit = 100))
+    
+    # Calculate summary statistics
+    util_summary <- data %>%
+      group_by(Treat_Control_Cohort, post_period) %>%
+      summarise(
+        n_members = n_distinct(MVDID),
+        mean_util = mean(!!sym(dependent_var)),
+        sd_util = sd(!!sym(dependent_var)),
+        n_with_any_util = sum(!!sym(dependent_var) > 0),
+        util_per_1000 = mean(!!sym(dependent_var)) * 1000,
+        .groups = "drop"
+      )
+    
+    list(
+      service_type = base_var,
+      model = model,
+      n_total_members = n_distinct(data$MVDID),
+      utilization_summary = util_summary,
+      balanced_cohort_summary = cohort_summary
+    )
+  }, error = function(e) {
+    cat("\nError fitting model for", base_var, ":", e$message, "\n")
+    return(NULL)
+  })
 }
 
-# Run models with winsorized variables
-models_w <- list(
-  eandem = run_nb_model("n_eandem_w", final_analytical_dataset_w),
-  pt = run_nb_model("n_pt_w", final_analytical_dataset_w),
-  lab = run_nb_model("n_laboratory_w", final_analytical_dataset_w),
-  mh = run_nb_model("n_mental_health_w", final_analytical_dataset_w),
-  st = run_nb_model("n_speech_therapy_w", final_analytical_dataset_w),
-  imm = run_nb_model("n_immunization_w", final_analytical_dataset_w),
-  prev = run_nb_model("n_preventive_w", final_analytical_dataset_w)
+# Define the service variables we want to focus on
+service_vars <- c(
+  "n_eandem_w",
+  "n_pt_w",
+  "n_laboratory_w",
+  "n_mental_health_w"
 )
 
-# Print summaries
-lapply(models_w, summary)
+# Run models for all members
+cat("\nProcessing ALL members models:\n")
+models_all <- lapply(service_vars, function(var_name) {
+  cat("\nProcessing", sub("n_(.+)_w$", "\\1", var_name), "...\n")
+  run_nb_model(var_name, final_analytical_dataset_w, users_only = FALSE)
+})
+
+# Run models for users only
+cat("\nProcessing USERS ONLY models:\n")
+models_users <- lapply(service_vars, function(var_name) {
+  cat("\nProcessing", sub("n_(.+)_w$", "\\1", var_name), "...\n")
+  run_nb_model(var_name, final_analytical_dataset_w, users_only = TRUE)
+})
+
+# Remove NULL results if any
+models_all <- models_all[!sapply(models_all, is.null)]
+models_users <- models_users[!sapply(models_users, is.null)]
+
+# Name the results using the service_type field
+names(models_all) <- sapply(models_all, function(x) x$service_type)
+names(models_users) <- sapply(models_users, function(x) x$service_type)
+
+# Print results for each service type
+for(service in names(models_users)) {
+  cat("\n\n================================================================")
+  cat("\nResults for", service)
+  cat("\n================================================================")
+  
+  cat("\n\nBALANCED COHORT SUMMARY:")
+  cat("\n----------------\n")
+  print(models_all[[service]]$balanced_cohort_summary)
+  
+  cat("\n\nALL MEMBERS ANALYSIS:")
+  cat("\n----------------")
+  cat("\nUtilization Summary:\n")
+  print(models_all[[service]]$utilization_summary)
+  cat("\nModel Summary:\n")
+  print(summary(models_all[[service]]$model))
+  
+  cat("\n\nUSERS ONLY ANALYSIS:")
+  cat("\n----------------")
+  cat("\nUtilization Summary:\n")
+  print(models_users[[service]]$utilization_summary)
+  cat("\nModel Summary:\n")
+  print(summary(models_users[[service]]$model))
+  
+  # Add comparison of key coefficients
+  cat("\n\nKEY COEFFICIENTS COMPARISON:")
+  cat("\n----------------")
+  all_coef <- coef(models_all[[service]]$model)
+  users_coef <- coef(models_users[[service]]$model)
+  
+  key_vars <- c("Treat_Control_Cohort1", "post_period1", "Treat_Control_Cohort1:post_period1")
+  
+  cat("\n                              All Members    Users Only")
+  for(var in key_vars) {
+    cat(sprintf("\n%-30s %10.3f %10.3f", var, all_coef[var], users_coef[var]))
+  }
+  cat("\n")
+}
+
+### A.1. PSM----
+library(MatchIt)
+library(MASS)
+library(dplyr)
+library(tidyr)
+library(Matching)
+library(rgenoud)
+library(dplyr)
+library(MASS)  # for negative binomial models
+library(tidyverse)
+
+# Create propensity scores first
+ps_model <- glm(Treat_Control_Cohort ~ age_group + PATIENTGENDER + 
+                  family_size_bins + HSA_Flag_final + comorbid_bins + 
+                  n_eandem_w + n_pt_w + n_laboratory_w + n_mental_health_w,
+                family = binomial, data = matching_data)
+ps_scores <- predict(ps_model, type = "response")
+
+# Prepare matching variables matrix
+X <- matching_data %>%
+  dplyr::select(n_eandem_w, n_pt_w, n_laboratory_w, n_mental_health_w,  # utilization vars first
+                age_group, PATIENTGENDER, family_size_bins, 
+                HSA_Flag_final, comorbid_bins) %>%
+  mutate(ps_score = ps_scores) %>%  # add PS scores
+  model.matrix(~ . - 1, .)  # convert to matrix, removing intercept
+
+# Convert treatment indicator to logical
+Tr <- matching_data$Treat_Control_Cohort == 1
+
+# Create exact matching vector
+exact_match <- grepl("comorbid_bins", colnames(X))
+
+# Run GenMatch
+gen_match <- GenMatch(Tr = Tr, X = X,
+                      pop.size = 1000,
+                      max.generations = 100,
+                      wait.generations = 10,
+                      M = 1,
+                      ties = FALSE,
+                      replace = FALSE,
+                      exact = exact_match,
+                      caliper = 0.25,
+                      estimand = "ATT")
+
+# Get matches using optimized weights
+matches <- Match(Tr = Tr, X = X,
+                 Weight.matrix = gen_match,
+                 M = 1,
+                 exact = c("comorbid_bins"),
+                 caliper = 0.25,
+                 replace = FALSE)
+
+# Check balance
+balance_stats <- summary(matches)
+
+# Get matched pairs
+matched_ids <- data.frame(
+  treat_id = matches$index.treated,
+  control_id = matches$index.control
+)
+
+# Create matched dataset for analysis
+final_analytical_dataset_matched <- final_analytical_dataset_w %>%
+  filter(MVDID %in% matching_data$MVDID[c(matched_ids$treat_id, 
+                                          matched_ids$control_id)])
+
+# Check balance
+balance_results <- check_balance(final_analytical_dataset_matched)
+print(balance_results)
+
+# Analysis for E&M Visits
+### E & M ================================================================
+cat("\nResults for eandem (MATCHED COHORT)\n")
+cat("================================================================\n\n")
+
+# Balance statistics
+balance_stats_eandem <- final_analytical_dataset_matched %>%
+  filter(post_period == 0) %>%
+  group_by(Treat_Control_Cohort) %>%
+  summarise(
+    n = n(),
+    mean_util = mean(n_eandem_w),
+    sd_util = sd(n_eandem_w)
+  )
+cat("Balance statistics for eandem :\n")
+print(balance_stats_eandem)
+
+# ALL MEMBERS ANALYSIS
+cat("\nALL MEMBERS ANALYSIS:\n")
+cat("----------------\n")
+
+# Utilization summary
+util_summary <- final_analytical_dataset_matched %>%
+  group_by(Treat_Control_Cohort, post_period) %>%
+  summarise(
+    n_members = n(),
+    mean_util = mean(n_eandem_w),
+    sd_util = sd(n_eandem_w),
+    n_with_any_util = sum(n_eandem_w > 0),
+    util_per_1000 = mean_util * 1000
+  )
+cat("Utilization Summary:\n")
+print(util_summary)
+
+# Negative binomial model
+formula <- n_eandem_w ~ Treat_Control_Cohort + post_period + 
+  age_group + family_size_bins + comorbid_bins + 
+  PATIENTGENDER + deductible_level + PCP_copay + 
+  HSA_Flag_final + Plan_year + 
+  Treat_Control_Cohort:post_period
+
+nb_model <- glm.nb(formula, data = final_analytical_dataset_matched)
+cat("\nModel Summary:\n\n")
+print(summary(nb_model))
+
+# USERS ONLY ANALYSIS
+cat("\nUSERS ONLY ANALYSIS:\n")
+cat("----------------\n")
+
+# Balance statistics for users
+balance_stats_eandem_users <- final_analytical_dataset_matched %>%
+  filter(post_period == 0, n_eandem_w > 0) %>%
+  group_by(Treat_Control_Cohort) %>%
+  summarise(
+    n = n(),
+    mean_util = mean(n_eandem_w),
+    sd_util = sd(n_eandem_w)
+  )
+cat("\nBalance statistics for eandem :\n")
+print(balance_stats_eandem_users)
+
+# Utilization summary for users
+users_util_summary <- final_analytical_dataset_matched %>%
+  filter(n_eandem_w > 0) %>%
+  group_by(Treat_Control_Cohort, post_period) %>%
+  summarise(
+    n_members = n(),
+    mean_util = mean(n_eandem_w),
+    sd_util = sd(n_eandem_w),
+    n_with_any_util = sum(n_eandem_w > 0),
+    util_per_1000 = mean_util * 1000
+  )
+cat("\nUtilization Summary:\n")
+print(users_util_summary)
+
+# Negative binomial model for users
+nb_model_users <- glm.nb(formula, 
+                         data = final_analytical_dataset_matched %>% 
+                           filter(n_eandem_w > 0))
+cat("\nModel Summary:\n\n")
+print(summary(nb_model_users))
+
+# Compare key coefficients
+key_coef_compare <- data.frame(
+  "All Members" = coef(nb_model)[c("Treat_Control_Cohort1", 
+                                   "post_period1", 
+                                   "Treat_Control_Cohort1:post_period1")],
+  "Users Only" = coef(nb_model_users)[c("Treat_Control_Cohort1", 
+                                        "post_period1", 
+                                        "Treat_Control_Cohort1:post_period1")]
+)
+cat("\nKEY COEFFICIENTS COMPARISON:\n")
+cat("----------------\n")
+print(key_coef_compare)
+
+# Analysis for PT Visits
+###  PT ================================================================
+cat("\n\nResults for pt (MATCHED COHORT)\n")
+cat("================================================================\n\n")
+
+# Balance statistics
+balance_stats_pt <- final_analytical_dataset_matched %>%
+  filter(post_period == 0) %>%
+  group_by(Treat_Control_Cohort) %>%
+  summarise(
+    n = n(),
+    mean_util = mean(n_pt_w),
+    sd_util = sd(n_pt_w)
+  )
+cat("Balance statistics for pt :\n")
+print(balance_stats_pt)
+
+# ALL MEMBERS ANALYSIS
+cat("\nALL MEMBERS ANALYSIS:\n")
+cat("----------------\n")
+
+# Utilization summary
+util_summary_pt <- final_analytical_dataset_matched %>%
+  group_by(Treat_Control_Cohort, post_period) %>%
+  summarise(
+    n_members = n(),
+    mean_util = mean(n_pt_w),
+    sd_util = sd(n_pt_w),
+    n_with_any_util = sum(n_pt_w > 0),
+    util_per_1000 = mean_util * 1000
+  )
+cat("Utilization Summary:\n")
+print(util_summary_pt)
+
+# Negative binomial model for PT
+formula_pt <- n_pt_w ~ Treat_Control_Cohort + post_period + 
+  age_group + family_size_bins + comorbid_bins + 
+  PATIENTGENDER + deductible_level + PCP_copay + 
+  HSA_Flag_final + Plan_year + 
+  Treat_Control_Cohort:post_period
+
+nb_model_pt <- glm.nb(formula_pt, data = final_analytical_dataset_matched)
+cat("\nModel Summary:\n\n")
+print(summary(nb_model_pt))
+
+# USERS ONLY ANALYSIS FOR PT
+cat("\nUSERS ONLY ANALYSIS:\n")
+cat("----------------\n")
+
+# Balance statistics for PT users
+balance_stats_pt_users <- final_analytical_dataset_matched %>%
+  filter(post_period == 0, n_pt_w > 0) %>%
+  group_by(Treat_Control_Cohort) %>%
+  summarise(
+    n = n(),
+    mean_util = mean(n_pt_w),
+    sd_util = sd(n_pt_w)
+  )
+cat("\nBalance statistics for pt :\n")
+print(balance_stats_pt_users)
+
+# Utilization summary for PT users
+users_util_summary_pt <- final_analytical_dataset_matched %>%
+  filter(n_pt_w > 0) %>%
+  group_by(Treat_Control_Cohort, post_period) %>%
+  summarise(
+    n_members = n(),
+    mean_util = mean(n_pt_w),
+    sd_util = sd(n_pt_w),
+    n_with_any_util = sum(n_pt_w > 0),
+    util_per_1000 = mean_util * 1000
+  )
+cat("\nUtilization Summary:\n")
+print(users_util_summary_pt)
+
+# Negative binomial model for PT users
+nb_model_pt_users <- glm.nb(formula_pt, 
+                            data = final_analytical_dataset_matched %>% 
+                              filter(n_pt_w > 0))
+cat("\nModel Summary:\n\n")
+print(summary(nb_model_pt_users))
+
+# Compare key coefficients for PT
+key_coef_compare_pt <- data.frame(
+  "All Members" = coef(nb_model_pt)[c("Treat_Control_Cohort1", 
+                                      "post_period1", 
+                                      "Treat_Control_Cohort1:post_period1")],
+  "Users Only" = coef(nb_model_pt_users)[c("Treat_Control_Cohort1", 
+                                           "post_period1", 
+                                           "Treat_Control_Cohort1:post_period1")]
+)
+cat("\nKEY COEFFICIENTS COMPARISON:\n")
+cat("----------------\n")
+print(key_coef_compare_pt)
+
+# Analysis for Laboratory Services
+### Lab ================================================================
+cat("\n\nResults for laboratory (MATCHED COHORT)\n")
+cat("================================================================\n\n")
+
+# Balance statistics
+balance_stats_lab <- final_analytical_dataset_matched %>%
+  filter(post_period == 0) %>%
+  group_by(Treat_Control_Cohort) %>%
+  summarise(
+    n = n(),
+    mean_util = mean(n_laboratory_w),
+    sd_util = sd(n_laboratory_w)
+  )
+cat("Balance statistics for laboratory :\n")
+print(balance_stats_lab)
+
+# ALL MEMBERS ANALYSIS
+cat("\nALL MEMBERS ANALYSIS:\n")
+cat("----------------\n")
+
+# Utilization summary
+util_summary_lab <- final_analytical_dataset_matched %>%
+  group_by(Treat_Control_Cohort, post_period) %>%
+  summarise(
+    n_members = n(),
+    mean_util = mean(n_laboratory_w),
+    sd_util = sd(n_laboratory_w),
+    n_with_any_util = sum(n_laboratory_w > 0),
+    util_per_1000 = mean_util * 1000
+  )
+cat("Utilization Summary:\n")
+print(util_summary_lab)
+
+# Negative binomial model for Laboratory
+formula_lab <- n_laboratory_w ~ Treat_Control_Cohort + post_period + 
+  age_group + family_size_bins + comorbid_bins + 
+  PATIENTGENDER + deductible_level + PCP_copay + 
+  HSA_Flag_final + Plan_year + 
+  Treat_Control_Cohort:post_period
+
+nb_model_lab <- glm.nb(formula_lab, data = final_analytical_dataset_matched)
+cat("\nModel Summary:\n\n")
+print(summary(nb_model_lab))
+
+# USERS ONLY ANALYSIS FOR LABORATORY
+cat("\nUSERS ONLY ANALYSIS:\n")
+cat("----------------\n")
+
+# Balance statistics for Laboratory users
+balance_stats_lab_users <- final_analytical_dataset_matched %>%
+  filter(post_period == 0, n_laboratory_w > 0) %>%
+  group_by(Treat_Control_Cohort) %>%
+  summarise(
+    n = n(),
+    mean_util = mean(n_laboratory_w),
+    sd_util = sd(n_laboratory_w)
+  )
+cat("\nBalance statistics for laboratory :\n")
+print(balance_stats_lab_users)
+
+# Utilization summary for Laboratory users
+users_util_summary_lab <- final_analytical_dataset_matched %>%
+  filter(n_laboratory_w > 0) %>%
+  group_by(Treat_Control_Cohort, post_period) %>%
+  summarise(
+    n_members = n(),
+    mean_util = mean(n_laboratory_w),
+    sd_util = sd(n_laboratory_w),
+    n_with_any_util = sum(n_laboratory_w > 0),
+    util_per_1000 = mean_util * 1000
+  )
+cat("\nUtilization Summary:\n")
+print(users_util_summary_lab)
+
+r
+
+Copy
+# Negative binomial model for Laboratory users
+nb_model_lab_users <- glm.nb(formula_lab, 
+                             data = final_analytical_dataset_matched %>% 
+                               filter(n_laboratory_w > 0))
+cat("\nModel Summary:\n\n")
+print(summary(nb_model_lab_users))
+
+# Compare key coefficients for Laboratory
+key_coef_compare_lab <- data.frame(
+  "All Members" = coef(nb_model_lab)[c("Treat_Control_Cohort1", 
+                                       "post_period1", 
+                                       "Treat_Control_Cohort1:post_period1")],
+  "Users Only" = coef(nb_model_lab_users)[c("Treat_Control_Cohort1", 
+                                            "post_period1", 
+                                            "Treat_Control_Cohort1:post_period1")]
+)
+cat("\nKEY COEFFICIENTS COMPARISON:\n")
+cat("----------------\n")
+print(key_coef_compare_lab)
+
+# Analysis for Mental Health Services
+### Mental Health ================================================================
+cat("\n\nResults for mental health (MATCHED COHORT)\n")
+cat("================================================================\n\n")
+
+# Balance statistics
+balance_stats_mh <- final_analytical_dataset_matched %>%
+  filter(post_period == 0) %>%
+  group_by(Treat_Control_Cohort) %>%
+  summarise(
+    n = n(),
+    mean_util = mean(n_mental_health_w),
+    sd_util = sd(n_mental_health_w)
+  )
+cat("Balance statistics for mental health :\n")
+print(balance_stats_mh)
+
+# ALL MEMBERS ANALYSIS
+cat("\nALL MEMBERS ANALYSIS:\n")
+cat("----------------\n")
+
+# Utilization summary
+util_summary_mh <- final_analytical_dataset_matched %>%
+  group_by(Treat_Control_Cohort, post_period) %>%
+  summarise(
+    n_members = n(),
+    mean_util = mean(n_mental_health_w),
+    sd_util = sd(n_mental_health_w),
+    n_with_any_util = sum(n_mental_health_w > 0),
+    util_per_1000 = mean_util * 1000
+  )
+cat("Utilization Summary:\n")
+print(util_summary_mh)
+
+# Negative binomial model for Mental Health
+formula_mh <- n_mental_health_w ~ Treat_Control_Cohort + post_period + 
+  age_group + family_size_bins + comorbid_bins + 
+  PATIENTGENDER + deductible_level + PCP_copay + 
+  HSA_Flag_final + Plan_year + 
+  Treat_Control_Cohort:post_period
+
+nb_model_mh <- glm.nb(formula_mh, data = final_analytical_dataset_matched)
+cat("\nModel Summary:\n\n")
+print(summary(nb_model_mh))
+
+# USERS ONLY ANALYSIS FOR MENTAL HEALTH
+cat("\nUSERS ONLY ANALYSIS:\n")
+cat("----------------\n")
+
+# Balance statistics for Mental Health users
+balance_stats_mh_users <- final_analytical_dataset_matched %>%
+  filter(post_period == 0, n_mental_health_w > 0) %>%
+  group_by(Treat_Control_Cohort) %>%
+  summarise(
+    n = n(),
+    mean_util = mean(n_mental_health_w),
+    sd_util = sd(n_mental_health_w)
+  )
+cat("\nBalance statistics for mental health :\n")
+print(balance_stats_mh_users)
+
+# Utilization summary for Mental Health users
+users_util_summary_mh <- final_analytical_dataset_matched %>%
+  filter(n_mental_health_w > 0) %>%
+  group_by(Treat_Control_Cohort, post_period) %>%
+  summarise(
+    n_members = n(),
+    mean_util = mean(n_mental_health_w),
+    sd_util = sd(n_mental_health_w),
+    n_with_any_util = sum(n_mental_health_w > 0),
+    util_per_1000 = mean_util * 1000
+  )
+cat("\nUtilization Summary:\n")
+print(users_util_summary_mh)
+
+# Negative binomial model for Mental Health users
+nb_model_mh_users <- glm.nb(formula_mh, 
+                            data = final_analytical_dataset_matched %>% 
+                              filter(n_mental_health_w > 0))
+cat("\nModel Summary:\n\n")
+print(summary(nb_model_mh_users))
+
+# Compare key coefficients for Mental Health
+key_coef_compare_mh <- data.frame(
+  "All Members" = coef(nb_model_mh)[c("Treat_Control_Cohort1", 
+                                      "post_period1", 
+                                      "Treat_Control_Cohort1:post_period1")],
+  "Users Only" = coef(nb_model_mh_users)[c("Treat_Control_Cohort1", 
+                                           "post_period1", 
+                                           "Treat_Control_Cohort1:post_period1")]
+)
+cat("\nKEY COEFFICIENTS COMPARISON:\n")
+cat("----------------\n")
+print(key_coef_compare_mh)
+
+# Final Summary of All Services
+### Final Summary ================================================================
+cat("\n\nSummary of Treatment Effects Across All Services\n")
+cat("================================================================\n\n")
+
+all_treatment_effects <- data.frame(
+  Service = c("E&M", "PT", "Laboratory", "Mental Health"),
+  
+  # All Members
+  All_Members_Treatment = c(
+    coef(nb_model)["Treat_Control_Cohort1:post_period1"],
+    coef(nb_model_pt)["Treat_Control_Cohort1:post_period1"],
+    coef(nb_model_lab)["Treat_Control_Cohort1:post_period1"],
+    coef(nb_model_mh)["Treat_Control_Cohort1:post_period1"]
+  ),
+  
+  # Users Only
+  Users_Only_Treatment = c(
+    coef(nb_model_users)["Treat_Control_Cohort1:post_period1"],
+    coef(nb_model_pt_users)["Treat_Control_Cohort1:post_period1"],
+    coef(nb_model_lab_users)["Treat_Control_Cohort1:post_period1"],
+    coef(nb_model_mh_users)["Treat_Control_Cohort1:post_period1"]
+  )
+)
+
+# Add p-values
+all_treatment_effects$All_Members_Pvalue <- c(
+  summary(nb_model)$coefficients["Treat_Control_Cohort1:post_period1", "Pr(>|z|)"],
+  summary(nb_model_pt)$coefficients["Treat_Control_Cohort1:post_period1", "Pr(>|z|)"],
+  summary(nb_model_lab)$coefficients["Treat_Control_Cohort1:post_period1", "Pr(>|z|)"],
+  summary(nb_model_mh)$coefficients["Treat_Control_Cohort1:post_period1", "Pr(>|z|)"]
+)
+
+all_treatment_effects$Users_Only_Pvalue <- c(
+  summary(nb_model_users)$coefficients["Treat_Control_Cohort1:post_period1", "Pr(>|z|)"],
+  summary(nb_model_pt_users)$coefficients["Treat_Control_Cohort1:post_period1", "Pr(>|z|)"],
+  summary(nb_model_lab_users)$coefficients["Treat_Control_Cohort1:post_period1", "Pr(>|z|)"],
+  summary(nb_model_mh_users)$coefficients["Treat_Control_Cohort1:post_period1", "Pr(>|z|)"]
+)
+
+# Convert coefficients to percentage changes
+all_treatment_effects$All_Members_Pct_Change <- 
+  (exp(all_treatment_effects$All_Members_Treatment) - 1) * 100
+all_treatment_effects$Users_Only_Pct_Change <- 
+  (exp(all_treatment_effects$Users_Only_Treatment) - 1) * 100
+
+# Round numeric columns to 3 decimal places
+all_treatment_effects <- all_treatment_effects %>%
+  mutate(across(where(is.numeric), ~round(., 3)))
+
+# Print final summary
+cat("\nFinal Treatment Effects Summary:\n")
+print(all_treatment_effects)
+
+# Add significance stars
+add_significance_stars <- function(p_value) {
+  if(is.na(p_value)) return("")
+  if(p_value < 0.001) return("***")
+  if(p_value < 0.01) return("**")
+  if(p_value < 0.05) return("*")
+  if(p_value < 0.1) return(".")
+  return("")
+}
+
+all_treatment_effects$All_Members_Significance <- 
+  sapply(all_treatment_effects$All_Members_Pvalue, add_significance_stars)
+all_treatment_effects$Users_Only_Significance <- 
+  sapply(all_treatment_effects$Users_Only_Pvalue, add_significance_stars)
+
+# Print final formatted summary
+cat("\nFinal Treatment Effects Summary with Significance Levels:\n")
+cat("Significance levels: *** p<0.001, ** p<0.01, * p<0.05, . p<0.1\n\n")
+print(all_treatment_effects)
 
 ## B. Clustered Standard Errors ----
 library(sandwich)
@@ -2714,76 +3354,45 @@ for(i in seq_along(clustered_results_w)) {
 
 ## C. Margins ----
 library(margins)
-library(ggeffects)
 
-# Function to calculate predicted margins and specific predictions
+## C. Margins ----
+library(ggeffects)  # Loading the correct package name
+
+# Function to calculate predicted margins
 calculate_margins <- function(model) {
-  # 1. Get average marginal effects for treatment*period interaction
-  avg_margins <- margins(model, 
-                         variables = c("Treat_Control_Cohort", "post_period"),
-                         interaction = TRUE)
-  
-  # 2. Get predicted margins across treatment and period
-  pred_margins <- ggpredict(model, terms = c("Treat_Control_Cohort", "post_period"))
-  
-  # 3. Get predictions at specific values (holding other variables at means/reference)
-  newdata <- expand.grid(
-    Treat_Control_Cohort = c(0, 1),
-    post_period = c(0, 1)
-  )
-  # Add mean/reference values for all other variables in the model
-  other_vars <- setdiff(names(model$model), c("Treat_Control_Cohort", "post_period"))
-  for(var in other_vars) {
-    if(is.factor(model$model[[var]])) {
-      newdata[[var]] <- factor(levels(model$model[[var]])[1], levels = levels(model$model[[var]]))
-    } else {
-      newdata[[var]] <- mean(model$model[[var]], na.rm = TRUE)
-    }
-  }
-  
-  specific_preds <- predict(model, newdata = newdata, se.fit = TRUE)
-  
-  return(list(
-    average_margins = avg_margins,
-    predicted_margins = pred_margins,
-    specific_predictions = data.frame(
-      newdata,
-      predicted = specific_preds$fit,
-      se = specific_preds$se.fit,
-      conf.low = specific_preds$fit - 1.96 * specific_preds$se.fit,
-      conf.high = specific_preds$fit + 1.96 * specific_preds$se.fit
-    )
-  ))
+  # Get predicted margins for treatment*period interaction
+  margins <- ggpredict(model, terms = c("Treat_Control_Cohort", "post_period"))
+  return(margins)
 }
 
-# Calculate margins for all models
+# Calculate predicted margins for all models
 margins_results_w <- lapply(models_w, calculate_margins)
 
-# Function to calculate DiD effect
+# Function to calculate DiD effect from margins
 calculate_did <- function(margins) {
-  # Using specific predictions for DiD calculation
-  preds <- margins$specific_predictions
+  # Extract predictions
+  preds <- margins$predicted
   
   # Calculate DiD
-  treated_diff <- with(preds[preds$Treat_Control_Cohort == 1,], 
-                       predicted[post_period == 1] - predicted[post_period == 0])
-  control_diff <- with(preds[preds$Treat_Control_Cohort == 0,], 
-                       predicted[post_period == 1] - predicted[post_period == 0])
-  did <- treated_diff - control_diff
+  did <- (preds[4] - preds[3]) - (preds[2] - preds[1])
   
-  # Calculate standard error
-  se <- with(preds, sqrt(se[Treat_Control_Cohort == 1 & post_period == 1]^2 +
-                           se[Treat_Control_Cohort == 1 & post_period == 0]^2 +
-                           se[Treat_Control_Cohort == 0 & post_period == 1]^2 +
-                           se[Treat_Control_Cohort == 0 & post_period == 0]^2))
+  # Calculate standard errors for difference
+  se <- sqrt(margins$std.error[4]^2 + margins$std.error[3]^2 + 
+               margins$std.error[2]^2 + margins$std.error[1]^2)
   
   # Calculate z-statistic and p-value
   z_stat <- did/se
   p_value <- 2 * (1 - pnorm(abs(z_stat)))
   
   return(list(
-    predictions = preds,
-    average_margins = margins$average_margins,
+    predictions = data.frame(
+      Treat_Control_Cohort = margins$x,
+      post_period = margins$group,
+      predicted = margins$predicted,
+      std.error = margins$std.error,
+      conf.low = margins$conf.low,
+      conf.high = margins$conf.high
+    ),
     did_effect = did,
     std.error = se,
     z_statistic = z_stat,
@@ -2800,20 +3409,15 @@ service_types <- c("E&M Services", "Physical Therapy", "Laboratory Services",
 
 for(i in seq_along(did_results_w)) {
   cat("\nResults for", service_types[i], ":\n")
-  
-  cat("\nAverage Marginal Effects:\n")
-  print(summary(did_results_w[[i]]$average_margins))
-  
-  cat("\nPredicted Values (holding other variables constant):\n")
+  cat("\nPredicted Values:\n")
   print(did_results_w[[i]]$predictions)
-  
   cat("\nDifference-in-Differences Effect:", round(did_results_w[[i]]$did_effect, 4))
   cat("\nStandard Error:", round(did_results_w[[i]]$std.error, 4))
   cat("\nZ-statistic:", round(did_results_w[[i]]$z_statistic, 4))
   cat("\nP-value:", round(did_results_w[[i]]$p_value, 4), "\n")
 }
 
-# Create summary table
+# Optional: Create a summary table of DiD effects
 did_summary <- data.frame(
   Service = service_types,
   DiD_Effect = sapply(did_results_w, function(x) x$did_effect),
