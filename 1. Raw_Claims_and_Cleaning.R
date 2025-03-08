@@ -2802,6 +2802,204 @@ for(service in names(models_users)) {
   cat("\n")
 }
 
+## B. Cluster Standard Erros @ SubscriberID----
+library(sandwich)
+library(lmtest)
+library(dplyr)
+
+# Function to run negative binomial models with clustered standard errors
+run_service_analysis <- function(service_type, data) {
+  # Create formula
+  formula <- as.formula(paste0("n_", service_type, "_w ~ 
+                              Treat_Control_Cohort*post_period +
+                              age_group + family_size_bins + comorbid_bins + 
+                              PATIENTGENDER + deductible_level + PCP_copay + 
+                              HSA_Flag_final + Plan_year"))
+  
+  # Fit model with increased iterations and adjusted convergence criteria
+  model <- try(glm.nb(formula, 
+                      data = data,
+                      control = glm.control(maxit = 1000, 
+                                            epsilon = 1e-8)))
+  
+  if(class(model)[1] != "try-error") {
+    tryCatch({
+      # Calculate clustered standard errors
+      clustered_se <- vcovCL(model, 
+                             cluster = data$SUBSCRIBERID, 
+                             type = "HC1")
+      
+      # Get robust test results
+      robust_results <- coeftest(model, vcov = clustered_se)
+      
+      # Create summary statistics
+      summary_stats <- data %>%
+        group_by(Treat_Control_Cohort, post_period) %>%
+        summarise(
+          n = n(),
+          mean = mean(get(paste0("n_", service_type, "_w"))),
+          sd = sd(get(paste0("n_", service_type, "_w"))),
+          users = sum(get(paste0("n_", service_type, "_w")) > 0),
+          .groups = 'drop'
+        )
+      
+      # Add model diagnostics
+      model_diagnostics <- list(
+        theta = model$theta,
+        AIC = AIC(model),
+        converged = model$converged,
+        deviance = model$deviance,
+        df.residual = model$df.residual
+      )
+      
+      return(list(
+        model = model,
+        robust_results = robust_results,
+        summary_stats = summary_stats,
+        clustered_se = clustered_se,
+        diagnostics = model_diagnostics
+      ))
+    }, error = function(e) {
+      cat("\nError in analysis for", service_type, ":", e$message, "\n")
+      return(NULL)
+    })
+  } else {
+    cat("\nModel fitting failed for", service_type, "\n")
+    return(NULL)
+  }
+}
+
+# Function to print model results
+print_results <- function(service_type, results) {
+  cat("\n\n================================================================")
+  cat("\nResults for", service_type)
+  cat("\n================================================================\n")
+  
+  # Print diagnostic information
+  if(!is.null(results$all_members$diagnostics)) {
+    cat("\nModel Diagnostics:")
+    cat("\n----------------\n")
+    print(results$all_members$diagnostics)
+  }
+  
+  # Print all members results
+  cat("\nALL MEMBERS ANALYSIS")
+  cat("\n------------------\n")
+  cat("\nUtilization Summary:\n")
+  print(results$all_members$summary_stats)
+  cat("\nModel Results (with clustered standard errors):\n")
+  print(results$all_members$robust_results)
+  
+  # Print users only results
+  cat("\n\nUSERS ONLY ANALYSIS")
+  cat("\n------------------\n")
+  cat("\nUtilization Summary:\n")
+  print(results$users_only$summary_stats)
+  cat("\nModel Results (with clustered standard errors):\n")
+  print(results$users_only$robust_results)
+  
+  # Print key coefficients comparison
+  if(!is.null(results$all_members) && !is.null(results$users_only)) {
+    cat("\n\nKEY COEFFICIENTS COMPARISON")
+    cat("\n-------------------------\n")
+    key_vars <- c("Treat_Control_Cohort1", "post_period1", "Treat_Control_Cohort1:post_period1")
+    
+    # Extract coefficients and standard errors
+    all_coef <- coef(results$all_members$robust_results)
+    all_se <- sqrt(diag(results$all_members$clustered_se))
+    
+    users_coef <- coef(results$users_only$robust_results)
+    users_se <- sqrt(diag(results$users_only$clustered_se))
+    
+    # Print coefficients
+    for(var in key_vars) {
+      cat(sprintf("\n%-30s %8.3f (%5.3f) %15.3f (%5.3f)",
+                  var,
+                  all_coef[var], all_se[var],
+                  users_coef[var], users_se[var]))
+    }
+    
+    # Print IRRs
+    cat("\n\nINCIDENCE RATE RATIOS")
+    cat("\n--------------------\n")
+    for(var in key_vars) {
+      cat(sprintf("%-30s %8.3f %23.3f\n",
+                  var,
+                  exp(all_coef[var]),
+                  exp(users_coef[var])))
+    }
+  }
+}
+
+# Run analyses
+results <- list()
+for(service in services) {
+  cat("\nProcessing", service, "...\n")
+  
+  # All members analysis
+  all_members <- run_service_analysis(service, final_analytical_dataset_w)
+  
+  # Users only analysis
+  users_only_data <- final_analytical_dataset_w %>%
+    group_by(MVDID) %>%
+    filter(sum(get(paste0("n_", service, "_w"))) > 0) %>%
+    ungroup()
+  users_only <- run_service_analysis(service, users_only_data)
+  
+  results[[service]] <- list(
+    all_members = all_members,
+    users_only = users_only
+  )
+  
+  # Print results for this service
+  print_results(service, results[[service]])
+}
+
+# Run this to save detailed results
+# capture_detailed_results(results)
+
+## C. Marginal Effects: Age and Sex----
+library(margins)
+
+# Relevel age_group with 50-64 as reference
+final_analytical_dataset_w$age_group <- relevel(final_analytical_dataset_w$age_group, 
+                                                ref = "18-34")
+
+# Modified function with error handling
+calculate_focused_marginal_effects <- function(model, data) {
+  tryCatch({
+    mfx <- margins(model, 
+                   variables = c("age_group", "PATIENTGENDER"))
+    mfx_summary <- summary(mfx)
+    return(mfx_summary)
+  }, error = function(e) {
+    message("Error calculating marginal effects: ", e$message)
+    return(NULL)
+  })
+}
+
+# Run for each service type
+for(service in services) {
+  cat("\n\n================================================================")
+  cat("\nMarginal Effects for", service)
+  cat("\n================================================================\n")
+  
+  # All members analysis
+  cat("\nALL MEMBERS ANALYSIS")
+  cat("\n------------------\n")
+  mfx_all <- calculate_focused_marginal_effects(results[[service]]$all_members$model, 
+                                                final_analytical_dataset_w)
+  print(mfx_all)
+  
+  # Users only analysis
+  cat("\nUSERS ONLY ANALYSIS")
+  cat("\n------------------\n")
+  mfx_users <- calculate_focused_marginal_effects(results[[service]]$users_only$model, 
+                                                  filter(final_analytical_dataset_w, 
+                                                         get(paste0("n_", service, "_w")) > 0))
+  print(mfx_users)
+}
+
 ### A.1. PSM----
 library(MatchIt)
 library(MASS)
@@ -2850,26 +3048,73 @@ gen_match <- GenMatch(Tr = Tr, X = X,
 matches <- Match(Tr = Tr, X = X,
                  Weight.matrix = gen_match,
                  M = 1,
-                 exact = c("comorbid_bins"),
+                 exact = exact_match,  # using the same exact_match vector we created for GenMatch
                  caliper = 0.25,
                  replace = FALSE)
 
 # Check balance
-balance_stats <- summary(matches)
+check_balance <- function(matched_data) {
+  # List of variables to check balance for
+  vars_to_check <- c("age_group", "PATIENTGENDER", "family_size_bins", 
+                     "HSA_Flag_final", "comorbid_bins", "n_eandem_w", 
+                     "n_pt_w", "n_laboratory_w", "n_mental_health_w")
+  
+  # Function to calculate standardized mean difference
+  smd <- function(x, treat) {
+    t1 <- mean(x[treat == 1], na.rm = TRUE)
+    t0 <- mean(x[treat == 0], na.rm = TRUE)
+    s1 <- sd(x[treat == 1], na.rm = TRUE)
+    s0 <- sd(x[treat == 0], na.rm = TRUE)
+    # Pooled standard deviation
+    s_pool <- sqrt((s1^2 + s0^2)/2)
+    # SMD
+    (t1 - t0)/s_pool
+  }
+  
+  # Initialize results list
+  balance_stats <- list()
+  
+  # Calculate balance statistics for each variable
+  for(var in vars_to_check) {
+    if(is.factor(matched_data[[var]]) || is.character(matched_data[[var]])) {
+      # For categorical variables, calculate chi-square test
+      tab <- table(matched_data[[var]], matched_data$Treat_Control_Cohort)
+      chi_test <- tryCatch(
+        chisq.test(tab),
+        error = function(e) list(p.value = NA)
+      )
+      
+      balance_stats[[var]] <- data.frame(
+        variable = var,
+        p_value = chi_test$p.value,
+        std_mean_diff = NA,
+        type = "categorical"
+      )
+    } else {
+      # For continuous variables, calculate t-test and SMD
+      t_test <- t.test(matched_data[[var]] ~ matched_data$Treat_Control_Cohort)
+      std_diff <- smd(matched_data[[var]], matched_data$Treat_Control_Cohort)
+      
+      balance_stats[[var]] <- data.frame(
+        variable = var,
+        p_value = t_test$p.value,
+        std_mean_diff = std_diff,
+        type = "continuous"
+      )
+    }
+  }
+  
+  # Combine all results
+  results_df <- do.call(rbind, balance_stats)
+  rownames(results_df) <- NULL
+  
+  return(results_df)
+}
 
-# Get matched pairs
-matched_ids <- data.frame(
-  treat_id = matches$index.treated,
-  control_id = matches$index.control
-)
-
-# Create matched dataset for analysis
-final_analytical_dataset_matched <- final_analytical_dataset_w %>%
-  filter(MVDID %in% matching_data$MVDID[c(matched_ids$treat_id, 
-                                          matched_ids$control_id)])
-
-# Check balance
+# Now run the balance check
 balance_results <- check_balance(final_analytical_dataset_matched)
+
+# View results
 print(balance_results)
 
 # Analysis for E&M Visits
@@ -3137,9 +3382,6 @@ users_util_summary_lab <- final_analytical_dataset_matched %>%
 cat("\nUtilization Summary:\n")
 print(users_util_summary_lab)
 
-r
-
-Copy
 # Negative binomial model for Laboratory users
 nb_model_lab_users <- glm.nb(formula_lab, 
                              data = final_analytical_dataset_matched %>% 
