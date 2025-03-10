@@ -2807,131 +2807,11 @@ library(sandwich)
 library(lmtest)
 library(dplyr)
 
-# Function to run negative binomial models with clustered standard errors
-run_service_analysis <- function(service_type, data) {
-  # Create formula
-  formula <- as.formula(paste0("n_", service_type, "_w ~ 
-                              Treat_Control_Cohort*post_period +
-                              age_group + family_size_bins + comorbid_bins + 
-                              PATIENTGENDER + deductible_level + PCP_copay + 
-                              HSA_Flag_final + Plan_year"))
-  
-  # Fit model with increased iterations and adjusted convergence criteria
-  model <- try(glm.nb(formula, 
-                      data = data,
-                      control = glm.control(maxit = 1000, 
-                                            epsilon = 1e-8)))
-  
-  if(class(model)[1] != "try-error") {
-    tryCatch({
-      # Calculate clustered standard errors
-      clustered_se <- vcovCL(model, 
-                             cluster = data$SUBSCRIBERID, 
-                             type = "HC1")
-      
-      # Get robust test results
-      robust_results <- coeftest(model, vcov = clustered_se)
-      
-      # Create summary statistics
-      summary_stats <- data %>%
-        group_by(Treat_Control_Cohort, post_period) %>%
-        summarise(
-          n = n(),
-          mean = mean(get(paste0("n_", service_type, "_w"))),
-          sd = sd(get(paste0("n_", service_type, "_w"))),
-          users = sum(get(paste0("n_", service_type, "_w")) > 0),
-          .groups = 'drop'
-        )
-      
-      # Add model diagnostics
-      model_diagnostics <- list(
-        theta = model$theta,
-        AIC = AIC(model),
-        converged = model$converged,
-        deviance = model$deviance,
-        df.residual = model$df.residual
-      )
-      
-      return(list(
-        model = model,
-        robust_results = robust_results,
-        summary_stats = summary_stats,
-        clustered_se = clustered_se,
-        diagnostics = model_diagnostics
-      ))
-    }, error = function(e) {
-      cat("\nError in analysis for", service_type, ":", e$message, "\n")
-      return(NULL)
-    })
-  } else {
-    cat("\nModel fitting failed for", service_type, "\n")
-    return(NULL)
-  }
-}
 
-# Function to print model results
-print_results <- function(service_type, results) {
-  cat("\n\n================================================================")
-  cat("\nResults for", service_type)
-  cat("\n================================================================\n")
-  
-  # Print diagnostic information
-  if(!is.null(results$all_members$diagnostics)) {
-    cat("\nModel Diagnostics:")
-    cat("\n----------------\n")
-    print(results$all_members$diagnostics)
-  }
-  
-  # Print all members results
-  cat("\nALL MEMBERS ANALYSIS")
-  cat("\n------------------\n")
-  cat("\nUtilization Summary:\n")
-  print(results$all_members$summary_stats)
-  cat("\nModel Results (with clustered standard errors):\n")
-  print(results$all_members$robust_results)
-  
-  # Print users only results
-  cat("\n\nUSERS ONLY ANALYSIS")
-  cat("\n------------------\n")
-  cat("\nUtilization Summary:\n")
-  print(results$users_only$summary_stats)
-  cat("\nModel Results (with clustered standard errors):\n")
-  print(results$users_only$robust_results)
-  
-  # Print key coefficients comparison
-  if(!is.null(results$all_members) && !is.null(results$users_only)) {
-    cat("\n\nKEY COEFFICIENTS COMPARISON")
-    cat("\n-------------------------\n")
-    key_vars <- c("Treat_Control_Cohort1", "post_period1", "Treat_Control_Cohort1:post_period1")
-    
-    # Extract coefficients and standard errors
-    all_coef <- coef(results$all_members$robust_results)
-    all_se <- sqrt(diag(results$all_members$clustered_se))
-    
-    users_coef <- coef(results$users_only$robust_results)
-    users_se <- sqrt(diag(results$users_only$clustered_se))
-    
-    # Print coefficients
-    for(var in key_vars) {
-      cat(sprintf("\n%-30s %8.3f (%5.3f) %15.3f (%5.3f)",
-                  var,
-                  all_coef[var], all_se[var],
-                  users_coef[var], users_se[var]))
-    }
-    
-    # Print IRRs
-    cat("\n\nINCIDENCE RATE RATIOS")
-    cat("\n--------------------\n")
-    for(var in key_vars) {
-      cat(sprintf("%-30s %8.3f %23.3f\n",
-                  var,
-                  exp(all_coef[var]),
-                  exp(users_coef[var])))
-    }
-  }
-}
+# Define services first
+services <- c("eandem", "pt", "laboratory", "mental_health")
 
-# Run analyses
+# Now run your analysis code
 results <- list()
 for(service in services) {
   cat("\nProcessing", service, "...\n")
@@ -2969,7 +2849,7 @@ final_analytical_dataset_w$age_group <- relevel(final_analytical_dataset_w$age_g
 calculate_focused_marginal_effects <- function(model, data) {
   tryCatch({
     mfx <- margins(model, 
-                   variables = c("age_group", "PATIENTGENDER"))
+                   variables = c("age_group", "PATIENTGENDER", "comorbid_bins", "HSA_Flag_final"))
     mfx_summary <- summary(mfx)
     return(mfx_summary)
   }, error = function(e) {
