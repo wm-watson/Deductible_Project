@@ -3551,34 +3551,152 @@ print(did_summary)
 
 ## D. Table 1----
 library(gtsummary)
+library(dplyr)
+library(kableExtra)
 
-# First, create a combined grouping variable
-final_analytical_dataset_w <- final_analytical_dataset_w %>%
-  mutate(study_group = paste(Treat_Control_Cohort, post_period, sep="_"))
+# First, identify all treatment subjects
+treatment_ids <- final_analytical_dataset_w %>%
+  filter(Treat_Control_Cohort == 1) %>%
+  select(MVDID) %>%
+  distinct()
 
-final_analytical_dataset_w %>%
-  select(study_group,
-         age_group,
-         PATIENTGENDER,
-         family_size_bins,
-         comorbid_bins,
-         tot_comorbidities,
-         deductible_level,
-         HSA_Flag_final,
-         n_eandem_w,
-         n_pt_w,
-         n_laboratory_w,
-         n_mental_health_w,
-         total_oop,
-         Plan_year) %>%
+# Create a dataset with just treatment subjects and classify by year dyad
+treatment_data <- final_analytical_dataset_w %>%
+  filter(MVDID %in% treatment_ids$MVDID) %>%
+  group_by(MVDID) %>%
+  mutate(
+    years_observed = paste(sort(unique(Plan_year)), collapse=", ")
+  ) %>%
+  ungroup()
+
+# Create baseline (pre-period) dataset for treatment group
+treatment_baseline <- treatment_data %>%
+  filter(post_period == 0) %>%
+  select(
+    MVDID, years_observed,
+    age_group, PATIENTGENDER, family_size_bins,
+    comorbid_bins, tot_comorbidities, deductible_level, HSA_Flag_final,
+    n_eandem_w, n_pt_w, n_laboratory_w, n_mental_health_w, total_oop
+  )
+
+# Calculate the changes in key metrics from pre to post period
+treatment_changes <- treatment_data %>%
+  group_by(MVDID) %>%
+  arrange(post_period) %>%
+  summarize(
+    years_observed = first(years_observed),
+    change_eandem = last(n_eandem_w) - first(n_eandem_w),
+    change_pt = last(n_pt_w) - first(n_pt_w),
+    change_lab = last(n_laboratory_w) - first(n_laboratory_w),
+    change_mh = last(n_mental_health_w) - first(n_mental_health_w),
+    change_oop = last(total_oop) - first(total_oop)
+  ) %>%
+  ungroup()
+
+# Join baseline and change data
+treatment_analysis <- treatment_baseline %>%
+  left_join(treatment_changes, by = c("MVDID", "years_observed"))
+
+# Define the main year dyads of interest and group others
+treatment_analysis <- treatment_analysis %>%
+  mutate(
+    time_period = case_when(
+      years_observed == "2018, 2019" ~ "2018-2019",
+      years_observed == "2019, 2020" ~ "2019-2020",
+      years_observed == "2020, 2021" ~ "2020-2021",
+      years_observed == "2021, 2022" ~ "2021-2022",
+      years_observed == "2022, 2023" ~ "2022-2023",
+      TRUE ~ "Other Pairs"
+    )
+  )
+
+# Create comprehensive Table 1 for treatment group by time period
+table1_treatment <- treatment_analysis %>%
+  select(
+    time_period,
+    # Baseline demographics
+    age_group, PATIENTGENDER, family_size_bins,
+    comorbid_bins, tot_comorbidities, 
+    # Insurance characteristics
+    deductible_level, HSA_Flag_final,
+    # Baseline utilization
+    n_eandem_w, n_pt_w, n_laboratory_w, n_mental_health_w, total_oop,
+    # Change measures
+    change_eandem, change_pt, change_lab, change_mh, change_oop
+  ) %>%
   tbl_summary(
-    by = study_group,
+    by = time_period,
     missing = "no",
+    label = list(
+      age_group ~ "Age Group",
+      PATIENTGENDER ~ "Gender",
+      family_size_bins ~ "Family Size",
+      comorbid_bins ~ "Comorbidity Category",
+      tot_comorbidities ~ "Total Comorbidities",
+      deductible_level ~ "Deductible Level",
+      HSA_Flag_final ~ "HSA Flag",
+      n_eandem_w ~ "Baseline E&M Visits",
+      n_pt_w ~ "Baseline PT Visits",
+      n_laboratory_w ~ "Baseline Lab Tests",
+      n_mental_health_w ~ "Baseline Mental Health Visits",
+      total_oop ~ "Baseline Out-of-Pocket Costs ($)",
+      change_eandem ~ "Change in E&M Visits",
+      change_pt ~ "Change in PT Visits",
+      change_lab ~ "Change in Lab Tests",
+      change_mh ~ "Change in Mental Health Visits",
+      change_oop ~ "Change in Out-of-Pocket Costs ($)"
+    ),
     statistic = list(
       all_continuous() ~ "{mean} ({sd})",
       all_categorical() ~ "{n} ({p}%)"
     )
   ) %>%
   add_n() %>%
-  add_p() %>%
-  modify_spanning_header(everything() ~ "Study Groups")
+  add_overall() %>%
+  modify_header(label ~ "**Characteristic**") %>%
+  modify_spanning_header(everything() ~ "Treatment Group Characteristics by Year Pair")
+
+# Also create a summary of utilization changes for easier reference
+changes_summary <- treatment_analysis %>%
+  group_by(time_period) %>%
+  summarize(
+    n = n(),
+    # E&M changes
+    mean_change_eandem = mean(change_eandem, na.rm = TRUE),
+    sd_change_eandem = sd(change_eandem, na.rm = TRUE),
+    # PT changes
+    mean_change_pt = mean(change_pt, na.rm = TRUE),
+    sd_change_pt = sd(change_pt, na.rm = TRUE),
+    # Lab changes
+    mean_change_lab = mean(change_lab, na.rm = TRUE),
+    sd_change_lab = sd(change_lab, na.rm = TRUE),
+    # Mental health changes
+    mean_change_mh = mean(change_mh, na.rm = TRUE),
+    sd_change_mh = sd(change_mh, na.rm = TRUE),
+    # OOP changes
+    mean_change_oop = mean(change_oop, na.rm = TRUE),
+    sd_change_oop = sd(change_oop, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(across(starts_with("mean_"), ~round(., 2))) %>%
+  mutate(across(starts_with("sd_"), ~round(., 2)))
+
+# Create a function to format the change values with SD
+format_change <- function(mean_val, sd_val) {
+  return(paste0(mean_val, " (", sd_val, ")"))
+}
+
+# Create a nicely formatted changes summary table
+changes_table <- changes_summary %>%
+  mutate(
+    E_M_Change = format_change(mean_change_eandem, sd_change_eandem),
+    PT_Change = format_change(mean_change_pt, sd_change_pt),
+    Lab_Change = format_change(mean_change_lab, sd_change_lab),
+    MH_Change = format_change(mean_change_mh, sd_change_mh),
+    OOP_Change = format_change(mean_change_oop, sd_change_oop)
+  ) %>%
+  select(time_period, n, E_M_Change, PT_Change, Lab_Change, MH_Change, OOP_Change)
+
+# Print the tables
+print(table1_treatment)
+print(changes_table)
