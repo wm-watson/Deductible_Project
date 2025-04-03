@@ -2654,6 +2654,8 @@ print(summary_stats_final, width = Inf)
 saveRDS(final_analytical_dataset_w, "final_analytical_dataset_w.rds")
 final_analytical_dataset_w <- readRDS("final_analytical_dataset_w.rds")
 
+write.csv(final_analytical_dataset_w, "final_analytical_dataset_w.csv", row.names = FALSE)
+
 # 4. Individual Fixed Effects Analysis---- 
 library(MASS)
 library(margins)
@@ -2665,143 +2667,82 @@ library(fixest)
 
 options(scipen = 999)
 ## A. DiD-Poisson ----
-start.time <- Sys.time()
-
-run_fe_model <- function(dependent_var, data, users_only = FALSE) {
-  # Get base variable name (remove _w suffix)
-  base_var <- sub("n_(.+)_w$", "\\1", dependent_var)
+# Simple fixed-effects Poisson for eandm
+# Simple fixed-effects Poisson for eandm with separate treatment
+run_eandm_analysis <- function(data, users_only = FALSE) {
   
-  # First ensure we have balanced panel
-  data <- data %>%
-    group_by(MVDID, Treat_Control_Cohort) %>%
-    filter(n_distinct(post_period) == 2) %>%
+  # Create working copy
+  working_data <- data %>% 
+    group_by(MVDID) %>%
+    filter(n() == 2) %>%  # Balance panel first
     ungroup()
   
+  cat("\nAfter initial balancing:")
+  cat("\nTotal observations:", nrow(working_data))
+  cat("\nUnique individuals:", length(unique(working_data$MVDID)))
+  
   if(users_only) {
-    data <- data %>%
+    # Create new working data for users only
+    working_data <- working_data %>%
       group_by(MVDID) %>%
-      filter(sum(!!sym(dependent_var)) > 0) %>%
+      filter(sum(n_eandem_w) > 0) %>%  # Keep only if any visits
       ungroup()
+    
+    cat("\n\nAfter restricting to users:")
+    cat("\nTotal observations:", nrow(working_data))
+    cat("\nUnique individuals:", length(unique(working_data$MVDID)))
   }
   
-  # Print cohort sizes before modeling
-  cohort_summary <- data %>%
+  # Summary stats
+  stats <- working_data %>%
     group_by(Treat_Control_Cohort, post_period) %>%
     summarise(
-      n_unique_members = n_distinct(MVDID),
+      n_individuals = n_distinct(MVDID),
+      mean_util = mean(n_eandem_w),
+      sd_util = sd(n_eandem_w),
       .groups = "drop"
     )
   
-  cat("\nCohort sizes for", base_var, ":\n")
-  print(cohort_summary)
+  cat("\n\nUtilization by group and period:")
+  print(stats)
   
-  # Fit fixed effects Poisson model with robust standard errors
-  tryCatch({
-    model <- feglm(
-      as.formula(paste(
-        dependent_var, "~ Treat_Control_Cohort*post_period + 
-        family_size_bins + comorbid_bins + 
-        deductible_level + 
-        HSA_Flag_final + Plan_year | MVDID"  # The | MVDID specifies individual FE
-      )),
-      data = data,
-      family = "poisson",
-      vcov = "hetero"  # Robust standard errors
-    )
-    
-    # Calculate summary statistics
-    util_summary <- data %>%
-      group_by(Treat_Control_Cohort, post_period) %>%
-      summarise(
-        n_members = n_distinct(MVDID),
-        mean_util = mean(!!sym(dependent_var)),
-        sd_util = sd(!!sym(dependent_var)),
-        n_with_any_util = sum(!!sym(dependent_var) > 0),
-        util_per_1000 = mean(!!sym(dependent_var)) * 1000,
-        .groups = "drop"
-      )
-    
-    list(
-      service_type = base_var,
-      model = model,
-      n_total_members = n_distinct(data$MVDID),
-      utilization_summary = util_summary,
-      balanced_cohort_summary = cohort_summary
-    )
-  }, error = function(e) {
-    cat("\nError fitting model for", base_var, ":", e$message, "\n")
-    return(NULL)
-  })
+  # Fit model
+  model <- feglm(
+    n_eandem_w ~ Treat_Control_Cohort*post_period + 
+      family_size_bins + comorbid_bins + 
+      deductible_level + HSA_Flag_final + 
+      Plan_year | MVDID,
+    data = working_data,
+    family = "poisson",
+    vcov = "hetero"
+  )
+  
+  return(model)
 }
 
-# Define the service variables we want to focus on
-service_vars <- c(
-  "n_eandem_w",
-  "n_pt_w",
-  "n_laboratory_w",
-  "n_mental_health_w"
+# Run analyses
+cat("\nALL MEMBERS ANALYSIS")
+all_members <- run_eandm_analysis(final_analytical_dataset_w, users_only = FALSE)
+
+cat("\n\nUSERS ONLY ANALYSIS")
+users_only <- run_eandm_analysis(final_analytical_dataset_w, users_only = TRUE)
+
+# Compare coefficients with standard errors
+key_vars <- c("post_period1", "Treat_Control_Cohort1:post_period1")
+
+coef_comparison <- data.frame(
+  Variable = c("Post Period", "Treatment x Post"),
+  All_Members = sprintf("%.3f (%.3f)", 
+                        coef(all_members)[key_vars],
+                        sqrt(diag(vcov(all_members)))[key_vars]),
+  Users_Only = sprintf("%.3f (%.3f)", 
+                       coef(users_only)[key_vars],
+                       sqrt(diag(vcov(users_only)))[key_vars])
 )
 
-# Run models for all members
-cat("\nProcessing ALL members models:\n")
-models_all <- lapply(service_vars, function(var_name) {
-  cat("\nProcessing", sub("n_(.+)_w$", "\\1", var_name), "...\n")
-  run_nb_model(var_name, final_analytical_dataset_w, users_only = FALSE)
-})
-
-# Run models for users only
-cat("\nProcessing USERS ONLY models:\n")
-models_users <- lapply(service_vars, function(var_name) {
-  cat("\nProcessing", sub("n_(.+)_w$", "\\1", var_name), "...\n")
-  run_nb_model(var_name, final_analytical_dataset_w, users_only = TRUE)
-})
-
-# Remove NULL results if any
-models_all <- models_all[!sapply(models_all, is.null)]
-models_users <- models_users[!sapply(models_users, is.null)]
-
-# Name the results using the service_type field
-names(models_all) <- sapply(models_all, function(x) x$service_type)
-names(models_users) <- sapply(models_users, function(x) x$service_type)
-
-# Print results for each service type
-for(service in names(models_users)) {
-  cat("\n\n================================================================")
-  cat("\nResults for", service)
-  cat("\n================================================================")
-  
-  cat("\n\nBALANCED COHORT SUMMARY:")
-  cat("\n----------------\n")
-  print(models_all[[service]]$balanced_cohort_summary)
-  
-  cat("\n\nALL MEMBERS ANALYSIS:")
-  cat("\n----------------")
-  cat("\nUtilization Summary:\n")
-  print(models_all[[service]]$utilization_summary)
-  cat("\nModel Summary:\n")
-  print(summary(models_all[[service]]$model))
-  
-  cat("\n\nUSERS ONLY ANALYSIS:")
-  cat("\n----------------")
-  cat("\nUtilization Summary:\n")
-  print(models_users[[service]]$utilization_summary)
-  cat("\nModel Summary:\n")
-  print(summary(models_users[[service]]$model))
-  
-  # Add comparison of key coefficients
-  cat("\n\nKEY COEFFICIENTS COMPARISON:")
-  cat("\n----------------")
-  all_coef <- coef(models_all[[service]]$model)
-  users_coef <- coef(models_users[[service]]$model)
-  
-  key_vars <- c("Treat_Control_Cohort1", "post_period1", "Treat_Control_Cohort1:post_period1")
-  
-  cat("\n                              All Members    Users Only")
-  for(var in key_vars) {
-    cat(sprintf("\n%-30s %10.3f %10.3f", var, all_coef[var], users_coef[var]))
-  }
-  cat("\n")
-}
+cat("\n\nKEY COEFFICIENTS COMPARISON:")
+cat("\n----------------------------------------\n")
+print(coef_comparison)
 
 ## B. Cluster Standard Erros @ SubscriberID----
 library(sandwich)
@@ -2885,6 +2826,92 @@ for(service in services) {
 
 #5. First Differenced Models  ----
 options(scipen = 999)
+
+library(lmtest)
+library(tidyverse)
+library(stats)
+library(sandwich)  # For robust standard errors
+
+# Keep and reshape data
+df_wide <- final_analytical_dataset_w %>%
+  filter(Treat_Control_Cohort == 1) %>%
+  group_by(MVDID) %>%
+  filter(n() == 2) %>%  # Keep only MVDIDs that appear exactly twice
+  ungroup() %>%
+  select(MVDID, subscriberid, post_period, 
+         n_eandem_w, n_pt_w, n_laboratory_w, n_mental_health_w,
+         family_size_bins, tot_comorbidities, deductible_level, HSA_Flag_final) %>%
+  pivot_wider(
+    id_cols = c(MVDID, subscriberid),
+    names_from = post_period,
+    names_glue = "{.value}{post_period}",
+    values_from = c(n_eandem_w, n_pt_w, n_laboratory_w, n_mental_health_w,
+                    family_size_bins, tot_comorbidities, deductible_level, HSA_Flag_final)
+  )
+
+# Create differences
+df_wide <- df_wide %>%
+  mutate(
+    diff_eandem = n_eandem_w1 - n_eandem_w0,
+    diff_pt = n_pt_w1 - n_pt_w0,
+    diff_lab = n_laboratory_w1 - n_laboratory_w0,
+    diff_mh = n_mental_health_w1 - n_mental_health_w0,
+    diff_fam = tot_comorbidities1 - tot_comorbidities0
+  )
+
+# Summary statistics
+summary(df_wide[c("diff_eandem", "diff_pt", "diff_lab", "diff_mh")])
+
+# T-tests
+t.test(df_wide$diff_eandem)
+t.test(df_wide$diff_pt)
+t.test(df_wide$diff_lab)
+t.test(df_wide$diff_mh)
+
+# Distribution analysis (quartiles)
+sapply(df_wide[c("diff_eandem", "diff_pt", "diff_lab", "diff_mh")], 
+       quantile, probs = c(0.25, 0.5, 0.75))
+
+# Correlation analysis
+cor_matrix <- cor(df_wide[c("diff_eandem", "diff_pt", "diff_lab", "diff_mh")],
+                  use = "complete.obs")
+cor_p_values <- cor.test(df_wide$diff_eandem, df_wide$diff_pt)$p.value
+print(cor_matrix)
+
+## Regression analysis with robust standard errors----
+# E&M visits
+em_reg <- lm(diff_eandem ~ diff_comorbid + diff_fam + n_eandem_w0, data = df_wide)
+coeftest(em_reg, vcov = vcovHC(em_reg, type = "HC1"))
+
+# PT visits
+pt_reg <- lm(diff_pt ~ diff_comorbid + diff_fam + n_pt_w0, data = df_wide)
+coeftest(pt_reg, vcov = vcovHC(pt_reg, type = "HC1"))
+
+# Laboratory visits
+lab_reg <- lm(diff_lab ~ diff_comorbid + diff_fam + n_laboratory_w0, data = df_wide)
+coeftest(lab_reg, vcov = vcovHC(lab_reg, type = "HC1"))
+
+# Mental Health visits
+mh_reg <- lm(diff_mh ~ diff_comorbid + diff_fam + n_mental_health_w0, data = df_wide)
+coeftest(mh_reg, vcov = vcovHC(mh_reg, type = "HC1"))
+
+## Cluster at family-level----
+# Regression analysis with clustered standard errors
+# E&M visits
+em_reg <- lm(diff_eandem ~ diff_comorbid + diff_fam + n_eandem_w0, data = df_wide)
+coeftest(em_reg, vcov = vcovCL(em_reg, cluster = df_wide$subscriberid))
+
+# PT visits
+pt_reg <- lm(diff_pt ~ diff_comorbid + diff_fam + n_pt_w0, data = df_wide)
+coeftest(pt_reg, vcov = vcovCL(pt_reg, cluster = df_wide$subscriberid))
+
+# Laboratory visits
+lab_reg <- lm(diff_lab ~ diff_comorbid + diff_fam + n_laboratory_w0, data = df_wide)
+coeftest(lab_reg, vcov = vcovCL(lab_reg, cluster = df_wide$subscriberid))
+
+# Mental Health visits
+mh_reg <- lm(diff_mh ~ diff_comorbid + diff_fam + n_mental_health_w0, data = df_wide)
+coeftest(mh_reg, vcov = vcovCL(mh_reg, cluster = df_wide$subscriberid))
 
 ## 5a. Table 1----
 library(gtsummary)
